@@ -1,0 +1,17 @@
+.libs/
+.git/
+.github/
+.pytest_cache/
+__pycache__/
+*.pyc
+.env
+.env.local
+*.log
+data/
+docs/
+guide.txt
+frontend/node_modules/
+frontend/dist/
+tests/
+scripts/
+.streamlit/

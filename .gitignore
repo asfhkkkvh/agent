@@ -1,0 +1,24 @@
+.env
+.env.local
+.libs/
+*.pyc
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+data/checkpoints.db
+data/*.db
+data/eval_reports/
+.streamlit/secrets.toml
+*.log
+.DS_Store
+htmlcov/
+.coverage
+
+# 前端
+frontend/node_modules/
+frontend/dist/
