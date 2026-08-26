@@ -38,9 +38,6 @@ mcp>=1.0.0
 # Windows 上 mcp 的 stdio 模块需要 pywintypes
 pywin32>=306; sys_platform == "win32"
 
-# ── UI ────────────────────────────────────────────────────────
-streamlit>=1.38.0
-
 # ── FastAPI REST 接口（app/api.py）──────────────────────────
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0

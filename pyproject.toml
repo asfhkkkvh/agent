@@ -14,7 +14,6 @@ select = ["E", "F", "I", "W"]
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E501"]
 "app/api.py" = ["E402"]  # 环境引导代码（代理/镜像/.env）必须在导入依赖之前执行
-"app/main.py" = ["E402"]
 "app/mcp/server.py" = ["E402"]  # pywin32 DLL 路径引导
 "scripts/ingest.py" = ["E402"]
 

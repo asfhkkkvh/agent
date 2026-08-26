@@ -1,8 +1,7 @@
 """
 OmniRAG — FastAPI 接口层
 ────────────────────────────────────
-与 Streamlit 入口（app/main.py）并行存在的 REST API，
-方便前端（React/Vue）或外部服务接入。
+React 前端的后端 API，同时提供 REST 与 SSE 流式接口。
 
 启动方式：
     uvicorn app.api:app --reload --host 0.0.0.0 --port 8000
@@ -26,12 +25,12 @@ from typing import Optional
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
-# .libs 目录装了所有第三方依赖，必须显式加入 sys.path（与 main.py 一致）
+# .libs 目录装了所有第三方依赖，必须显式加入 sys.path
 _LIBS_DIR = os.path.join(_PROJECT_ROOT, ".libs")
 if os.path.isdir(_LIBS_DIR) and _LIBS_DIR not in sys.path:
     sys.path.insert(0, _LIBS_DIR)
 
-# 加载 .env 到 os.environ（与 Streamlit 入口保持一致）
+# 加载 .env 到 os.environ
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
@@ -62,7 +61,7 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 
-# 复用 Streamlit 入口里调用的同一套核心函数，保证两条入口走同一逻辑
+# 复用工作流与导入模块的同一套核心函数
 from app.graph.workflow import run_query, stream_query
 from app.rag.evaluation import generate_eval_dataset, run_ragas_evaluation
 from app.rag.ingestion import extract_from_text, ingest_documents, ingest_file
@@ -160,7 +159,7 @@ def query(req: QueryRequest) -> QueryResponse:
     """
     主查询接口：
         监督者路由 → RAG/Web Agent → 综合 → 评估循环
-    等价于 Streamlit 中的 run_query(query, thread_id) 调用。
+    等价于直接调用 run_query(query, thread_id)。
     """
     thread_id = req.thread_id or str(uuid.uuid4())
     try:

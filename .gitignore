@@ -13,7 +13,6 @@ venv/
 data/checkpoints.db
 data/*.db
 data/eval_reports/
-.streamlit/secrets.toml
 *.log
 .DS_Store
 htmlcov/

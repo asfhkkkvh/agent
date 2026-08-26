@@ -57,12 +57,6 @@ RUN mkdir -p data
 RUN useradd -m -u 1000 omnirag && chown -R omnirag:omnirag /app
 USER omnirag
 
-# Streamlit config
-ENV STREAMLIT_SERVER_PORT=8501
-ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
-ENV STREAMLIT_SERVER_HEADLESS=true
-ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
-
 EXPOSE 8000
 
 # Health check

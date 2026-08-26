@@ -14,7 +14,7 @@
 - **对话记忆**：SQLite checkpoint 持久化，监督者与综合 Agent 都能看到最近对话
 - **流式执行**：SSE 实时推送 路由 → 检索 → 综合 → 评审 的每一步
 - **量化评估**：RAGAS 四指标（Faithfulness / Answer Relevancy / Context Precision / Recall），评测报告自动存档
-- **双入口**：React + shadcn/ui 高级感前端（默认）、Streamlit 精简版（备用）
+- **高级感前端**：React 19 + TypeScript + Tailwind CSS v4 + shadcn/ui
 - **可观测**：LangSmith 全链路追踪
 
 ## 架构
@@ -138,7 +138,6 @@ app/
   rag/                    # 混合检索、重排、知识图谱、导入、RAGAS 评估
   mcp/server.py           # MCP 工具服务器
   api.py                  # FastAPI 接口 + 前端静态托管
-  main.py                 # Streamlit 备用入口
 frontend/                 # React + shadcn/ui 前端
 tests/                    # 单元测试
 data/eval_reports/        # RAGAS 评估报告（自动生成）
