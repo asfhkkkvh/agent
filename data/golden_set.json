@@ -1,0 +1,65 @@
+{
+  "_comment": "人工校验黄金集（2026-08-29 按当前知识库内容改写）。query 全部可从已导入 Qdrant 的 3 个 source（tmpuuuklmuf=MemCache前缀缓存项目、tmplt5x4eiq=OmniRAG旧版README、eval_test=OmniRAG描述文本）检索到答案；ground_truth 尽量贴近原文措辞以保证 recall@k 余弦相似度。JSON 不支持注释，_comment 字段会被加载器忽略。",
+  "samples": [
+    {
+      "query": "MemCache 的四种布局策略分别是什么，各自的缓存命中率是多少？",
+      "ground_truth": "四种布局策略为 naive、optimized、optimized_summary、dynamic_prefix。命中率分别为 naive 94.3%、optimized 90.1%、optimized_summary 72.3%、dynamic_prefix 5.7%。naive 命中率最高但把旧 RAG 资料存进历史导致 prompt 无限膨胀。",
+      "source": "tmpuuuklmuf"
+    },
+    {
+      "query": "为什么说 prompt 缓存要求从开头逐 token 匹配，稳定前缀为什么重要？",
+      "ground_truth": "API 提供商（DeepSeek / OpenAI）的 prompt 缓存要求从开头开始逐 token 匹配。稳定前缀（系统提示、摘要）永远放最前命中率最高；对话历史追加式增长天然共享前缀；单轮 RAG 结果放在当前用户消息之后不写入历史；任何动态内容（时间戳、request_id）出现在头部会导致整条前缀作废。",
+      "source": "tmpuuuklmuf"
+    },
+    {
+      "query": "纯 LRU 淘汰有什么缺陷，MemCache 的 radix tree 是如何解决的？",
+      "ground_truth": "纯 LRU 只看最近是否被访问，会误删正在被其他会话共享的热前缀。本实现给每个节点维护 refcount，每条会话对从根到叶的整条路径持有引用，只有 refcount == 0 的节点才进入淘汰候选，再按 last_access（LRU）挑 victim，这样共享前缀被任意活跃会话使用时都不会被误伤。",
+      "source": "tmpuuuklmuf"
+    },
+    {
+      "query": "为什么历史超过阈值后压缩成摘要会导致缓存 miss？",
+      "ground_truth": "历史超阈值时把早期轮次压缩成摘要，会让摘要文本加上剩余历史整体位移，从而付一次全量 miss。正确策略是整块压缩，每 N 轮截断一次，边界之间保持追加式增长，而不是每轮都压缩。",
+      "source": "tmpuuuklmuf"
+    },
+    {
+      "query": "MemCache 项目的目录结构包含哪些模块？",
+      "ground_truth": "项目结构为 pca/radix.py（RadixPrefixCache 压缩前缀树 + 引用计数 + LRU 淘汰）、tokenizer.py（tiktoken）、layout.py（四种布局策略与 prompt 组装）、memory.py（SQLite 会话记忆）、agent.py（私人对话智能体）、traces.py（LangGraph checkpoint 解析 + 合成轨迹）、experiment.py（对照实验 + 报告生成）、cli.py（命令行）。",
+      "source": "tmpuuuklmuf"
+    },
+    {
+      "query": "OmniRAG 采用了哪些技术栈？",
+      "ground_truth": "LLM 与嵌入用智谱 GLM-4-Flash、embedding-3；混合检索用 Qdrant（dense + sparse）、FastEmbed BM25、RRF 融合；重排用 BAAI/bge-reranker-base（本地）；知识图谱用 Neo4j + jieba 分词；编排用 LangGraph（异步节点）；记忆用 SQLite checkpoint；可观测性用 LangSmith；评估用 RAGAS；Web 搜索用 Tavily；后端用 FastAPI + SSE；前端用 React 19 + Vite + TypeScript + Tailwind CSS v4 + shadcn/ui；部署用 Docker / docker-compose。",
+      "source": "tmplt5x4eiq"
+    },
+    {
+      "query": "如何启动 OmniRAG 的后端与前端？",
+      "ground_truth": "启动后端用 uvicorn app.api:app --reload --port 8000；启动前端开发模式需要 Node.js 18+，cd frontend 后 npm install 再 npm run dev，访问 http://localhost:5173 会自动代理 /api 到 8000；生产模式 npm run build 后 FastAPI 自动托管 frontend/dist，直接访问 http://localhost:8000 即可。",
+      "source": "tmplt5x4eiq"
+    },
+    {
+      "query": "OmniRAG 的评估与修订闭环是如何工作的？",
+      "ground_truth": "监督者路由查询，RAG 知识库与实时网络双源检索（真正并行），综合 Agent 生成答案，评审 Agent 校验答案，如果评审返回 REVISE 反馈就传回综合 Agent 携带反馈逐条迭代修订，直到 GOOD 或达到最大轮数才输出最终答案。",
+      "source": "tmplt5x4eiq"
+    },
+    {
+      "query": "怎么向 OmniRAG 知识库导入文档？",
+      "ground_truth": "可以用命令行 python scripts/ingest.py --file docs/report.pdf、--dir ./my_docs 或 --text \"要导入的文本\" --label \"我的资料\" 导入；也可以在界面的知识库页面上传文件或粘贴文本。",
+      "source": "tmplt5x4eiq"
+    },
+    {
+      "query": "OmniRAG 的 RAGAS 评估包含哪四个核心指标？",
+      "ground_truth": "OmniRAG 的评估体系基于 RAGAS 框架，包含四个核心指标：Faithfulness 衡量答案是否忠于检索上下文，Answer Relevancy 衡量答案是否切题，Context Precision 衡量检索上下文是否精炼，Context Recall 衡量检索是否召回了必要信息。评估使用智谱 GLM-4 作为 judge LLM。",
+      "source": "eval_test"
+    },
+    {
+      "query": "OmniRAG 的混合检索由哪三路构成，如何融合？",
+      "ground_truth": "OmniRAG 的检索系统采用三路混合检索：Dense 向量检索使用智谱 embedding-3 模型生成 1024 维向量；Sparse 检索使用 BM25 算法捕获关键词匹配；知识图谱检索通过 Neo4j 实现多跳推理。三路结果通过倒数秩融合合并。",
+      "source": "eval_test"
+    },
+    {
+      "query": "OmniRAG 包含哪些智能体？",
+      "ground_truth": "OmniRAG 是一个多智能体混合检索增强生成系统，使用 LangGraph 进行工作流编排，包含监督者 Agent、RAG Agent、Web Agent、综合 Agent 和评估 Agent。系统采用 Qdrant 作为混合向量数据库，支持 Dense 和 Sparse 检索，Cross-Encoder 重排序器对检索结果精排提高准确率。",
+      "source": "eval_test"
+    }
+  ]
+}

@@ -16,6 +16,8 @@ export default defineConfig({
       "/api": {
         target: "http://localhost:8000",
         changeOrigin: true,
+        // 评估端点耗时长（3-10 分钟），默认超时太短会导致连接被代理切断
+        timeout: 600000,
       },
     },
   },

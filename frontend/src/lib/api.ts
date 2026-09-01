@@ -2,7 +2,6 @@ export interface AppConfig {
   app_title: string
   model: string
   embedding_model: string
-  use_kg: boolean
   use_multi_query: boolean
   max_iterations: number
   retrieval_top_k: number
@@ -38,22 +37,49 @@ export interface CollectionStats {
   error?: string
 }
 
+export interface EvalSampleDetail {
+  query: string
+  ground_truth: string
+  source?: string
+  answer: string
+  recall_hit: number
+  faithfulness?: number | null
+  answer_relevancy?: number | null
+}
+
 export interface EvalResult {
-  metrics: Record<string, number>
+  metrics: Record<string, number | null>
   sample_count: number
   summary: string
   report_path?: string
-  samples?: { query: string; ground_truth: string; answer: string }[]
+  samples?: EvalSampleDetail[]
   error?: string
 }
 
-async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init)
-  if (!res.ok) {
-    const body = await res.json().catch(() => null)
-    throw new Error(body?.detail || `请求失败 (${res.status})`)
+async function jsonFetch<T>(url: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
+  // 默认不超时；评估等长任务通过 timeoutMs 显式给长超时
+  const controller = timeoutMs ? new AbortController() : undefined
+  const timer = controller
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : undefined
+  try {
+    const res = await fetch(url, {
+      ...init,
+      signal: controller ? controller.signal : init?.signal,
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => null)
+      throw new Error(body?.detail || `请求失败 (${res.status})`)
+    }
+    return res.json() as Promise<T>
+  } catch (e: any) {
+    if (e?.name === "AbortError") {
+      throw new Error(`请求超时（${Math.round((timeoutMs || 0) / 1000)}s）`)
+    }
+    throw e
+  } finally {
+    if (timer) clearTimeout(timer)
   }
-  return res.json() as Promise<T>
 }
 
 export function getConfig(): Promise<AppConfig> {
@@ -81,12 +107,17 @@ export function ingestFile(file: File) {
   })
 }
 
-export function runEval(sampleCount?: number): Promise<EvalResult> {
-  return jsonFetch("/api/evaluate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sample_count: sampleCount ?? null }),
-  })
+export function runEval(k?: number, threshold?: number): Promise<EvalResult> {
+  // 评估耗时长（每样本多次 LLM 调用），给 10 分钟超时避免浏览器/Vite 代理提前切断
+  return jsonFetch(
+    "/api/evaluate",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ k: k ?? null, threshold: threshold ?? null }),
+    },
+    600000,
+  )
 }
 
 export async function streamQuery(

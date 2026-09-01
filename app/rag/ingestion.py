@@ -1,10 +1,13 @@
 """
 OmniRAG — 导入管道
-────────────────────────────
-通过 Docling 处理 PDF/文档 → 分块 → 嵌入（dense + sparse）
-→ 插入 Qdrant 混合集合。
+─────────────────────────────
+文档解析 → 分块 → 嵌入（dense + sparse）→ 插入 Qdrant 混合集合。
 
-支持：PDF、DOCX、TXT、Markdown、Web URL
+文档解析优先级：
+1. Docling（若已安装）：支持 PDF/DOCX 富结构（表格、版面）
+2. PyMuPDF（已内置）：PDF 纯文本+表格兜底
+3. zipfile 标准库：DOCX 纯文本兜底（零额外依赖）
+TXT/Markdown 直接读取。
 """
 
 import hashlib
@@ -15,7 +18,7 @@ from typing import List
 
 try:
     from docling.document_converter import DocumentConverter
-except ImportError:  # docling 可选：未安装时仍可导入文本/查询，仅 PDF 解析不可用
+except ImportError:  # docling 可选：未安装时走 pymupdf/zipfile 兜底
     DocumentConverter = None
 from fastembed import SparseTextEmbedding
 
@@ -40,7 +43,7 @@ def get_dense_embeddings():
     """智谱 dense 嵌入（embedding-3, 指定 1024 维以匹配 Qdrant collection）。"""
     return ZhipuAIEmbeddings(
         model=settings.zhipu_embedding_model,
-        zhipuai_api_key=settings.zhipuai_api_key,
+        api_key=settings.zhipuai_api_key,  # langchain-community>=0.4 字段从 zhipuai_api_key 改为 api_key
         dimensions=1024,
     )
 
@@ -226,21 +229,42 @@ def get_vector_store() -> QdrantVectorStore:
 # ── 文档提取 ───────────────────────────────────────────────────────────────────
 
 def extract_with_docling(file_path: str) -> List[Document]:
+    """从文件提取结构化内容，返回 LangChain Documents。
+
+    优先用 Docling（富结构），未安装时按扩展名走轻量兜底：
+    - PDF → PyMuPDF（已内置，按页提取文本+表格）
+    - DOCX → zipfile 标准库解析 XML（零额外依赖）
+    - TXT/MD → 直接读取
     """
-    使用 Docling 从 PDF/DOCX 等文件中提取丰富的结构化内容。
-    返回带有元数据的 LangChain Documents。
-    """
-    if DocumentConverter is None:
-        raise ImportError("docling 未安装，无法解析 PDF/DOCX。请运行: pip install docling")
+    file_name = Path(file_path).stem
+    file_hash = _file_hash(file_path)
+    ext = Path(file_path).suffix.lower()
+
+    # ── 优先：Docling（富结构：表格、版面）──────────────────────
+    if DocumentConverter is not None:
+        try:
+            return _extract_with_docling_impl(file_path, file_name, file_hash)
+        except Exception as e:
+            logger.warning("Docling 解析失败 (%s)，回退到轻量解析器: %s", file_path, e)
+
+    # ── 兜底：按扩展名分流 ──────────────────────────────────────
+    if ext == ".pdf":
+        return _extract_pdf_pymupdf(file_path, file_name, file_hash)
+    if ext == ".docx":
+        return _extract_docx_zipfile(file_path, file_name, file_hash)
+    if ext in (".txt", ".md", ".markdown"):
+        return _extract_text_file(file_path, file_name, file_hash)
+    raise ValueError(f"不支持的文件类型: {ext}（支持 PDF/DOCX/TXT/MD）")
+
+
+def _extract_with_docling_impl(file_path, file_name, file_hash) -> List[Document]:
+    """Docling 实际实现：富结构（文本+表格）提取。"""
     converter = DocumentConverter()
     result = converter.convert(file_path)
     doc = result.document
-
     documents = []
-    file_name = Path(file_path).stem
-    file_hash = _file_hash(file_path)
 
-    # ── 1. 文本分块 ────────────────────────────────────────────
+    # 文本分块（按页）
     full_md = doc.export_to_markdown()
     pages = full_md.split("<!-- page break -->")
     for i, page_text in enumerate(pages, start=1):
@@ -249,30 +273,95 @@ def extract_with_docling(file_path: str) -> List[Document]:
             continue
         documents.append(Document(
             page_content=text,
-            metadata={
-                "source": file_name,
-                "file_hash": file_hash,
-                "page": i,
-                "content_type": "text",
-            }
+            metadata={"source": file_name, "file_hash": file_hash,
+                      "page": i, "content_type": "text"}
         ))
-
-    # ── 2. 表格 ────────────────────────────────────────────────
+    # 表格
     for table in doc.tables:
         table_md = table.export_to_markdown()
         if table_md.strip():
             documents.append(Document(
                 page_content=table_md,
-                metadata={
-                    "source": file_name,
-                    "file_hash": file_hash,
-                    "page": getattr(table, "page_no", 0),
-                    "content_type": "table",
-                }
+                metadata={"source": file_name, "file_hash": file_hash,
+                          "page": getattr(table, "page_no", 0), "content_type": "table"}
             ))
-
-    logger.info("Extracted %d documents from %s", len(documents), file_name)
+    logger.info("Docling 提取 %d 个文档块 from %s", len(documents), file_name)
     return documents
+
+
+def _extract_pdf_pymupdf(file_path, file_name, file_hash) -> List[Document]:
+    """用 PyMuPDF（已内置）解析 PDF：按页提取文本，表格转 markdown。"""
+    import pymupdf
+    documents = []
+    doc = pymupdf.open(file_path)
+    for i, page in enumerate(doc, start=1):
+        # 文本
+        text = page.get_text("text").strip()
+        if len(text) >= 50:
+            documents.append(Document(
+                page_content=text,
+                metadata={"source": file_name, "file_hash": file_hash,
+                          "page": i, "content_type": "text"}
+            ))
+        # 表格（PyMuPDF 内置表格检测）
+        try:
+            tables = page.find_tables()
+            for t in tables:
+                # 转 markdown 字符串
+                md = t.extract().to_markdown(index=False) if hasattr(t.extract(), "to_markdown") else None
+                if md and md.strip():
+                    documents.append(Document(
+                        page_content=md,
+                        metadata={"source": file_name, "file_hash": file_hash,
+                                  "page": i, "content_type": "table"}
+                    ))
+        except Exception:
+            pass  # 表格提取失败不影响文本
+    doc.close()
+    logger.info("PyMuPDF 提取 %d 个文档块 from %s", len(documents), file_name)
+    return documents
+
+
+def _extract_docx_zipfile(file_path, file_name, file_hash) -> List[Document]:
+    """用标准库 zipfile 解析 DOCX：提取 word/document.xml 的纯文本（零额外依赖）。"""
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    documents = []
+    with zipfile.ZipFile(file_path) as z:
+        xml = z.read("word/document.xml")
+    # DOCX 命名空间
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    tree = ET.fromstring(xml)
+    paragraphs = []
+    for p in tree.iter(f"{{{ns['w']}}}p"):
+        texts = [t.text for t in p.iter(f"{{{ns['w']}}}t") if t.text]
+        para = "".join(texts).strip()
+        if para:
+            paragraphs.append(para)
+
+    full_text = "\n\n".join(paragraphs)
+    if len(full_text) >= 50:
+        documents.append(Document(
+            page_content=full_text,
+            metadata={"source": file_name, "file_hash": file_hash,
+                      "page": 1, "content_type": "text"}
+        ))
+    logger.info("zipfile 提取 %d 个文档块 from %s (DOCX)", len(documents), file_name)
+    return documents
+
+
+def _extract_text_file(file_path, file_name, file_hash) -> List[Document]:
+    """直接读取 TXT/Markdown。"""
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        text = f.read().strip()
+    if not text:
+        return []
+    return [Document(
+        page_content=text,
+        metadata={"source": file_name, "file_hash": file_hash,
+                  "page": 1, "content_type": "text"}
+    )]
 
 
 def extract_from_text(text: str, source: str = "manual") -> List[Document]:
@@ -280,6 +369,7 @@ def extract_from_text(text: str, source: str = "manual") -> List[Document]:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
+        separators=["\n## ", "\n### ", "\n\n", "\n", "。", " ", ""],
     )
     chunks = splitter.create_documents([text], metadatas=[{
         "source": source,
@@ -328,15 +418,6 @@ def ingest_documents(documents: List[Document]) -> int:
     vs = get_vector_store()
     ids = vs.add_documents(chunked)
     logger.info("Successfully ingested %d chunks.", len(ids))
-
-    # ── 增量构建知识图谱 ──────────────────────────────────────
-    if settings.use_kg_retrieval:
-        try:
-            from app.rag.kg import build_knowledge_graph
-            rel_count = build_knowledge_graph(chunked)
-            logger.info("知识图谱增量更新：%d 条关系。", rel_count)
-        except Exception as e:
-            logger.warning("知识图谱构建失败（不影响向量导入）: %s", e)
 
     return len(ids)
 

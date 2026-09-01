@@ -43,7 +43,11 @@ function StatCard({
   )
 }
 
-function Dropzone({ onUpload }: { onUpload: (files: File[]) => void }) {
+function Dropzone({
+  onUpload,
+}: {
+  onUpload: (files: File[]) => void
+}) {
   const [drag, setDrag] = useState(false)
   const [busy, setBusy] = useState(false)
 
@@ -63,6 +67,7 @@ function Dropzone({ onUpload }: { onUpload: (files: File[]) => void }) {
           const res = await ingestFile(file)
           toast.success(`${file.name}:${res.message}`)
         }
+        toast.success("导入完成")
       } catch (e) {
         toast.error(String(e))
       } finally {
@@ -139,7 +144,7 @@ export function DataPage() {
     }
   }
 
-  const sourceCount = stats ? Object.keys(stats.sources).length : 0
+  const sourceCount = stats?.sources ? Object.keys(stats.sources).length : 0
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -154,8 +159,8 @@ export function DataPage() {
           <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
             <StatCard label="向量分块" value={stats ? String(stats.points ?? "—") : "…"} icon={Files} tint="bg-primary/15 text-primary" />
             <StatCard label="来源文档" value={stats ? String(sourceCount) : "…"} icon={BookOpenText} tint="bg-cyan-500/15 text-cyan-400" />
-            <StatCard label="文本块" value={stats ? String(stats.content_types.text ?? 0) : "…"} icon={FileText} tint="bg-emerald-500/15 text-emerald-400" />
-            <StatCard label="表格块" value={stats ? String(stats.content_types.table ?? 0) : "…"} icon={Table2} tint="bg-violet-500/15 text-violet-400" />
+            <StatCard label="文本块" value={stats ? String(stats.content_types?.text ?? 0) : "…"} icon={FileText} tint="bg-emerald-500/15 text-emerald-400" />
+            <StatCard label="表格块" value={stats ? String(stats.content_types?.table ?? 0) : "…"} icon={Table2} tint="bg-violet-500/15 text-violet-400" />
           </div>
 
           {stats?.error && (
@@ -168,7 +173,7 @@ export function DataPage() {
           <Card className="border-border/60 bg-card/50 backdrop-blur-sm">
             <CardHeader>
               <CardTitle className="text-base">上传文件</CardTitle>
-              <CardDescription>解析 PDF / DOCX / TXT / MD,自动去重并增量构建知识图谱(如开启)</CardDescription>
+              <CardDescription>解析 PDF / DOCX / TXT / MD,自动去重、分块并双路嵌入入库</CardDescription>
             </CardHeader>
             <CardContent>
               <Dropzone onUpload={() => setTimeout(refresh, 3000)} />
@@ -200,13 +205,13 @@ export function DataPage() {
           </Card>
 
           {/* 来源分布 */}
-          {stats && !stats.error && Object.keys(stats.sources).length > 0 && (
+          {stats && !stats.error && Object.keys(stats.sources ?? {}).length > 0 && (
             <Card className="border-border/60 bg-card/50 backdrop-blur-sm">
               <CardHeader>
                 <CardTitle className="text-base">来源分布</CardTitle>
               </CardHeader>
               <CardContent className="space-y-2">
-                {Object.entries(stats.sources).map(([name, count]) => (
+                {Object.entries(stats.sources ?? {}).map(([name, count]) => (
                   <div key={name} className="flex items-center justify-between rounded-lg border border-border/40 bg-card/40 px-3 py-2 text-sm">
                     <span className="truncate">{name}</span>
                     <span className="ml-3 shrink-0 tabular-nums text-muted-foreground">{count} 块</span>

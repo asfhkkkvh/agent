@@ -38,21 +38,23 @@
   "一个生产级的多智能体 AI 系统，通过将混合 RAG 知识库
    与实时网络搜索相结合来回答问题，由 LangGraph 编排，
    由 LangSmith 追踪，配备 MCP 工具，并免费部署在
-   Streamlit Cloud 上。"
+   Render 上。"
 
-  🌐  他们还能通过知识图谱（Neo4j）把跨页面的
+  🌐  （历史功能）他们曾能通过知识图谱（Neo4j）把跨页面的
       实体和关系串起来做多跳推理
       （GPT-4 → OpenAI → Microsoft 这样的关系链路）
+      【已移除，仅作历史参考】
 
-  📊  他们的回答质量可以用 RAGAS 框架给出
-      量化分数（faithfulness 等四个维度），
+  📊  他们的回答质量用轻量评估量化打分：
+      人工黄金集 + 检索 recall@k + LLM-as-judge
+      （faithfulness / answer_relevancy），
       不再凭感觉评估
 
-  🔌  除了 Streamlit 网页，他们还提供 FastAPI
+  🔌  除了 React 网页，他们还提供 FastAPI
       接口（REST API），方便其他程序调用：
       - /api/query   查询
       - /api/ingest  导入文档
-      - /api/evaluate 跑 RAGAS 评估
+      - /api/evaluate 跑轻量评估
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  第 2 部分 — 为什么我们需要这个项目？
@@ -105,11 +107,10 @@
 
   多智能体混合解决方案：
   100% 免费，使用免费套餐：
-  - Google Gemini API：  免费（15 次请求/分钟）
+  - 智谱 GLM-4-Flash：  免费（15 次请求/分钟）
   - Qdrant Cloud：       免费（1 GB 存储）
   - LangSmith：          免费（每月 5,000 次追踪）
   - Tavily Search：      免费（每月 1,000 次搜索）
-  - Streamlit Cloud：    免费部署
   - GitHub Actions：     免费 CI/CD
 
 谁需要这个项目？
@@ -136,9 +137,8 @@
   → 将其转换为特殊的数字模式（嵌入：[0.2, -0.5, 0.8 ...]）
   → 使用密集搜索（基于语义）搜索 Qdrant 数据库
   → 同时使用稀疏/BM25（基于关键词，如"Q3 2024"）搜索
-  → 合并两种搜索结果（倒数排名融合）
-  → 若启用 KG，还从 Neo4j 图谱按关键词找相关实体 + 1 跳邻居
-  → 三路候选 MD5 去重，运行重排序器挑选最佳的 5 个文本块
+  → 合并两种搜索结果（倒数排名融合 RRF）
+  → 双路候选 MD5 去重，运行重排序器挑选最佳的 5 个文本块
   → 找到："Apple 2024 年第三季度收入为 858 亿美元..." 来自你的 PDF
 
 步骤 3 — 网络智能体搜索互联网
@@ -173,9 +173,8 @@
   multi-agent-hybrid-rag/
   │
   ├── app/                         ← 所有主要应用代码都在这里
-  │   ├── config.py                ← "设置大脑"（含 Neo4j/KG/eval 配置）
-  │   ├── main.py                  ← "门面" — Streamlit UI（319 行）
-  │   ├── api.py                   ← FastAPI REST 接口（query/ingest/evaluate）
+  │   ├── config.py                ← "设置大脑"（智谱 GLM/Qdrant/评估配置）
+  │   ├── api.py                   ← FastAPI REST 接口（query/ingest/evaluate）+ 前端静态托管
   │   │
   │   ├── agents/                  ← "工作团队"
   │   │   ├── rag_agent.py         ← 文档研究员（74 行）
@@ -184,17 +183,18 @@
   │   │   └── critique_agent.py    ← 质量检查员（73 行）
   │   │
   │   ├── rag/                     ← "图书馆系统"
-  │   │   ├── ingestion.py         ← 读取并存储文档（含 KG 建图）
-  │   │   ├── retriever.py         ← 三路混合搜索（向量+BM25+图）
+  │   │   ├── ingestion.py         ← 读取、分块并存储文档（dense+sparse）
+  │   │   ├── retriever.py         ← 双路混合搜索（dense+sparse RRF + 重排）
   │   │   ├── reranker.py          ← 挑选最佳结果（57 行）
-  │   │   ├── kg.py                ← Neo4j 知识图谱：抽实体+建图+1跳检索
-  │   │   └── evaluation.py       ← RAGAS 4 维量化评估
+  │   │   └── evaluation.py       ← 轻量评估（黄金集+recall@k+LLM-as-judge）
   │   │
   │   ├── mcp/
   │   │   └── server.py            ← "工具箱服务器"（258 行）
   │   │
   │   └── graph/
   │       └── workflow.py          ← "交通控制器"（254 行）
+  │
+  ├── frontend/                    ← React 19 + Vite + TS + shadcn/ui 前端
   │
   ├── scripts/
   │   └── ingest.py                ← 命令行文档上传器
@@ -207,8 +207,8 @@
   │
   ├── Dockerfile                   ← 容器配方（52 行）
   ├── docker-compose.yml           ← 一条命令启动一切（54 行）
-  ├── requirements.txt             ← 所需的所有库（含 neo4j/ragas）
-  ├── .env.example                 ← 密钥模板（含 Neo4j/KG/eval）
+  ├── requirements.txt             ← 所需的所有库（智谱 GLM + Qdrant + 轻量评估）
+  ├── .env.example                 ← 密钥模板（4 个 key：智谱/Qdrant/LangSmith/Tavily）
   └── README.md                    ← 完整文档
 
   代码总量：32 个文件，约 2,000+ 行
@@ -237,16 +237,16 @@
 关键代码：
   ┌─────────────────────────────────────────────────────────┐
   │  class Settings(BaseSettings):                          │
-  │      google_api_key: str = Field(..., env="GOOGLE_API_KEY") │
+  │      zhipuai_api_key: str = Field(..., env="ZHIPUAI_API_KEY") │
   │      qdrant_url: str = Field(..., env="QDRANT_URL")     │
   │      retrieval_top_k: int = Field(10, ...)              │
-  │      chunk_size: int = Field(1000, ...)                 │
+  │      chunk_size: int = Field(400, ...)                 │
   └─────────────────────────────────────────────────────────┘
 
-  第 13 行：google_api_key → 从 .env 文件读取 GOOGLE_API_KEY
+  第 13 行：zhipuai_api_key → 从 .env 文件读取 ZHIPUAI_API_KEY
   第 30 行：qdrant_url    → 我们在线数据库的地址
   第 36 行：retrieval_top_k = 10 → 在重排序前获取 10 个候选
-  第 38 行：chunk_size = 1000  → 将文档分块为 1000 字符的片段
+  第 38 行：chunk_size = 400    → 将文档分块为 400 字符的片段（CHUNK_OVERLAP=40，按标题 header-aware 切分）
 
 为什么重要：
   没有这个文件，每个开发者都会直接在代码中硬编码 API 密钥。
@@ -280,18 +280,19 @@
      │  full_md = doc.export_to_markdown()            │
      │  pages = full_md.split("<!-- page break -->")  │
      └────────────────────────────────────────────────┘
-     使用 Docling 库（强大的 PDF 阅读器）提取：
-     - 文本（每个段落，按页面分割）
-     - 表格（单独保存，带上下文）
+     Docling 优先，未安装时走轻量兜底：
+     - PDF → PyMuPDF（已内置，按页提取文本+表格）
+     - DOCX → zipfile 标准库解析 XML（零额外依赖）
+     - TXT/MD → 直接读取
      保存的元数据：源文件名、页码、内容类型
 
   2. get_dense_embeddings()  [第 36-40 行]
      ┌────────────────────────────────────────────────┐
-     │  return GoogleGenerativeAIEmbeddings(          │
-     │      model="models/gemini-embedding-001"       │
+     │  return ZhipuAIEmbeddings(                     │
+     │      model="embedding-3"                       │
      │  )                                             │
      └────────────────────────────────────────────────┘
-     使用 Gemini 将文本转换为 768 维数字向量。
+     使用智谱 embedding-3 将文本转换为 1024 维数字向量。
      这些数字捕捉了文本的含义。
      "猫"和"小猫"会有相似的数字模式。
 
@@ -303,6 +304,8 @@
      └────────────────────────────────────────────────┘
      BM25 是经典的关键词搜索（就像旧版 Google）。
      非常适合精确术语："Q3 2024"、"EBITDA"、人名。
+     新增 FastEmbedSparseAdapter 把它适配为 langchain
+     Embeddings 接口（embed_documents / embed_query）。
 
   4. ingest_documents(documents)  [第 106-138 行]
      ┌────────────────────────────────────────────────┐
@@ -317,9 +320,13 @@
 
   5. ensure_collection()  [第 58-72 行]
      在 Qdrant 中创建混合集合，包含：
-     - "dense" 向量（768 维，余弦距离）
+     - "dense" 向量（1024 维，余弦距离）
      - "sparse" 向量（BM25 关键词索引）
      两者都存在于同一个集合中以进行混合搜索。
+     维度校验：若已存在集合维度不是 1024，自动删除重建。
+     新增 _ensure_payload_indexes：为 source/content_type/page
+     建 keyword/integer 索引（key 是 metadata.source 等嵌套路径，
+     因为 langchain_qdrant 把 metadata 存在 payload.metadata.* 下）。
 
 为什么重要：
   这是基础。没有好的入库：
@@ -362,7 +369,7 @@
      示例："给我看年度报告的第 5 页"
      → 填写：source="annual-report", page=5
 
-  2. _get_relevant_documents()  [第 59-83 行]
+  2. invoke()  [第 59-83 行]（原 _get_relevant_documents，新版 langchain_core 已移除该方法）
      ┌────────────────────────────────────────────────┐
      │  # 步骤 1：LLM 提取过滤器                     │
      │  filters = self._extract_filters(query)        │
@@ -377,6 +384,8 @@
      └────────────────────────────────────────────────┘
      这是 RAG 系统的核心。
      三层智能堆叠在一起。
+     过滤器 key 为 metadata.source / metadata.content_type /
+     metadata.page（嵌套路径，匹配 langchain_qdrant 实际存储结构）。
 
   3. MultiQueryRetriever  [第 106-130 行]
      ┌────────────────────────────────────────────────┐
@@ -524,7 +533,7 @@
 
 它的作用：
   接收问题 → 使用 HybridRetriever 搜索知识库 →
-  格式化所有检索到的文本块 → 发送给 Gemini 进行摘要和
+  格式化所有检索到的文本块 → 发送给智谱 GLM-4 进行摘要和
   将发现整理成带有来源引用的结构化 markdown。
 
 像五岁小孩理解的那样：
@@ -535,7 +544,7 @@
 
 关键代码：
   ┌────────────────────────────────────────────────────────┐
-  │  docs = self.retriever.get_relevant_documents(query)   │
+  │  docs = self.retriever.invoke(query)                  │
   │                                                        │
   │  # 带引用格式化                                       │
   │  f"[Doc {i}] 来源: {meta['source']} | 页面: {page}" │
@@ -558,7 +567,7 @@
 它的作用：
   使用 Tavily API 搜索实时互联网。
   返回 5 个带有 URL、标题、内容的实时网络结果。
-  然后使用 Gemini 清理、整理和摘要这些结果。
+  然后使用智谱 GLM-4 清理、整理和摘要这些结果。
 
 像五岁小孩理解的那样：
   你想知道今天的板球比分。
@@ -713,8 +722,12 @@
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-文件 11: app/main.py  (319 行) — 门面（Streamlit UI）
+文件 11: frontend/ — 门面（React UI，替代原 Streamlit）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+注意：前端已从 Streamlit 迁移到 React 19 + TypeScript +
+Tailwind CSS v4 + shadcn/ui。原 app/main.py（Streamlit）
+已被 React 前端取代，由 FastAPI 托管 frontend/dist。
 
 它的作用：
   用户看到并与之交互的网络界面。
@@ -842,7 +855,7 @@
    添加我的食谱书（COPY requirements.txt）。
    练习食谱（pip install）。
    雇佣一个不是老板的厨师（非 root 用户）。
-   在 8501 号门开餐厅（EXPOSE 8501）。"
+   在 8000 号门开餐厅（EXPOSE 8000）。"
   Docker 读取这张卡片，在任何地方创建相同的厨房！
 
 关键行：
@@ -851,9 +864,9 @@
   第 11 行： COPY requirements.txt .             ← 复制库列表
   第 12 行： RUN pip install -r requirements.txt ← 安装一切
   第 35 行： RUN useradd -m multi agent hybrid              ← 安全：非 root
-  第 41 行： EXPOSE 8501                         ← 开放网络端口
+  第 41 行： EXPOSE 8000                         ← 开放网络端口
   第 48 行： HEALTHCHECK ...                     ← 监控应用是否存活
-  第 51 行： CMD ["streamlit", "run", ...]       ← 启动命令
+  第 51 行： CMD ["uvicorn", "app.api:app", ...] ← 启动命令（FastAPI 托管前端 dist）
 
 多阶段构建（高级）：
   阶段 1（构建器）：安装所有依赖
@@ -862,11 +875,16 @@
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-文件 15: app/rag/kg.py — 知识图谱工程师
+文件 15: app/rag/kg.py — 知识图谱工程师 【已移除，仅作历史参考】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+⚠️ 2026-09 技术重构已彻底删除本模块（含 neo4j/jieba 依赖与
+NEO4J_* 配置）。原 kg_retrieve 只是 jieba 关键词 + 1 跳邻居，
+并非真正的图推理，成本高收益低。现在检索为 dense+sparse
+双路 + RRF + 重排。以下为历史讲解，保留作学习素材。
+
 它的作用：
-  当文档被导入时，让 Gemini LLM 从每个文本块中抽取
+  当文档被导入时，让智谱 GLM-4 从每个文本块中抽取
   "实体 + 关系"（比如 OpenAI → 开发了 → GPT-4），
   把这些三元组写入 Neo4j 图数据库。
   查询时，从用户问题中找关键词，定位 Neo4j 里的相关实体，
@@ -897,7 +915,7 @@
      │  EXTRACT_PROMPT | structured_llm               │
      │  → ExtractionResult(entities, relations)      │
      └────────────────────────────────────────────────┘
-     用 Gemini 的 with_structured_output 强制返回
+     用智谱 GLM-4 的 with_structured_output 强制返回
      Pydantic 结构（Entity + Relation），实体名称规范化。
 
   3. _cypher_merge(tx, entities, relations, source)
@@ -926,57 +944,94 @@
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-文件 16: app/rag/evaluation.py — 量化评估员
+文件 16: app/rag/evaluation.py — 轻量评估员
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 它的作用：
-  用 RAGAS 框架给 RAG 系统打"量化分数"。
-  不再凭感觉说"答案好像不错"，而是给出 4 个标准指标：
-  - faithfulness（忠实性）：答案是否基于上下文、没编造
-  - answer_relevancy（切题性）：答案是否回应了问题
-  - context_precision（上下文精准）：检索的片段是否相关
-  - context_recall（上下文召回）：该检索到的是否都检索到
+  用轻量评估给 RAG 系统打"量化分数"，共 3 个指标：
+  - recall_at_k（检索召回）：对每条黄金样本取回 top-k chunk，
+    用智谱 embedding 计算 ground_truth 与各 chunk 的最大余弦
+    相似度，超过阈值（默认 0.7）记为命中，命中率即 recall@k
+  - faithfulness（忠实性）：答案是否基于上下文、没编造（LLM 打分 0-1）
+  - answer_relevancy（切题性）：答案是否回应了问题（LLM 打分 0-1）
+
+评测集：
+  人工黄金集 data/golden_set.json：人工校验的 (query, ground_truth, source)，
+  不再由系统自产自销，避免自引用失真。
+  报告自动保存到 data/eval_reports/eval_<时间戳>.json。
 
 像五岁小孩理解的那样：
   LangSmith 像行车记录仪，记录每次出行但不说好坏；
-  RAGAS 像车辆年检，给出一张可对比的评分表。
+  评估模块像车辆年检，给出一张可对比的评分表。
   改 prompt 或换参数后跑一次，分数涨了就是进步。
 
 关键函数：
 
-  1. generate_eval_dataset(n)  [第 40 行]
+  1. load_golden_set()  [第 38 行]
      ┌────────────────────────────────────────────────┐
-     │  docs = vectorstore.similarity_search(...)     │
-     │  for doc in docs[:n]:                          │
-     │      q = llm.invoke(GEN_QUERY_PROMPT, doc=...)  │
-     │      samples.append({question, ground_truth}) │
+     │  rows = data.get("samples", data)              │
+     │  samples = [                                   │
+     │      {"query":..., "ground_truth":...,         │
+     │       "source":...} for s in rows ...]         │
      └────────────────────────────────────────────────┘
-     从已导入文档里 LLM 自动生成 N 条
-     (query, ground_truth) 评估对，无需人工标注。
+     加载人工黄金集，兼容顶层数组 / 顶层对象两种格式。
 
-  2. run_ragas_evaluation(samples)  [第 80 行]
+  2. run_evaluation()  [第 184 行]
      ┌────────────────────────────────────────────────┐
-     │  from ragas import evaluate                    │
-     │  result = evaluate(                            │
-     │      dataset,                                   │
-     │      metrics=[faithfulness, answer_relevancy,  │
-     │               context_precision, context_recall],│
-     │      llm=ChatGoogleGenerativeAI(...),           │
-     │      embeddings=get_dense_embeddings())        │
-     │  return result.to_pandas()                     │
+     │  result = run_query(query, thread_id=...,      │
+     │                     max_iterations=1)          │
+     │  ctxs = _retrieve_top_k(s, k)                  │
+     │  hit = _max_cosine(ground_truth, ctxs) >= th   │
+     │  judge = _judge(query, answer, ctxs)           │
      └────────────────────────────────────────────────┘
-     对每个 sample 跑一次完整 RAG 流水线拿 answer+contexts，
-     再用 Gemini 作 judge LLM 跑 ragas.evaluate 4 维打分。
-     judge 用 Gemini 而非 GPT，与生产 LLM 同源避免跨模型偏差。
+     对每条黄金样本跑一次 RAG 流水线拿答案 + 检索 top-k，
+     计算 recall@k，再用智谱 GLM-4 作 judge LLM 打
+     faithfulness / answer_relevancy 分（0-1）。
 
   3. __main__ 入口
      python -m app.rag.evaluation 可直接命令行跑评估。
 
 为什么重要：
   Self-Critique 循环是在线质量门禁（决定要不要重写），
-  RAGAS 是离线量化评估（给迭代效果打分）。
+  轻量评估是离线量化评估（给迭代效果打分）。
   两者不冲突：一个管"这次答案能不能发出去"，
   一个管"我整体 RAG 系统水平怎么样"。
+
+【已移除，仅作历史参考】旧版曾用 RAGAS 框架做 4 维量化评估
+（faithfulness / answer_relevancy / context_precision / context_recall），
+依赖 ragas / datasets / pyarrow。因存在 pyarrow MonthDayNano pickle bug、
+NaN 结果、judge 与生成同模型自引用失真等问题，2026-09 重构后
+已移除 ragas 依赖，改为上面的轻量评估。旧方案讲解保留作学习素材：
+
+  旧 generate_eval_dataset(n)  [第 40 行]
+     ┌────────────────────────────────────────────────┐
+     │  docs = get_vector_store().similarity_search() │
+     │  for doc in docs[:n]:                          │
+     │      raw = llm.invoke(GEN_QUERY_PROMPT.format) │
+     │      q = _extract_json(raw)["question"]        │
+     │      samples.append(SingleTurnSample(          │
+     │          user_input=q, reference=doc.page...)) │
+     └────────────────────────────────────────────────┘
+     从已导入文档里 LLM 自动生成 N 条评估对，无需人工标注。
+
+  旧 run_ragas_evaluation(samples)  [第 80 行]
+     ┌────────────────────────────────────────────────┐
+     │  from ragas.dataset_schema import (            │
+     │      EvaluationDataset, SingleTurnSample)      │
+     │  settings.max_iterations = 1  # 临时关闭循环   │
+     │  dataset = EvaluationDataset(                 │
+     │      samples=_build_ragas_dataset(samples))    │
+     │  result = evaluate(                            │
+     │      dataset=dataset,                           │
+     │      metrics=[faithfulness, answer_relevancy,  │
+     │               context_precision, context_recall],│
+     │      llm=ChatZhipuAI(...),                     │
+     │      embeddings=get_dense_embeddings(),        │
+     │      run_config=RunConfig(                     │
+     │          max_workers=1, max_retries=1))         │
+     │  return result._repr_dict  # 聚合均值           │
+     └────────────────────────────────────────────────┘
+     再用智谱 GLM-4 作 judge LLM 跑 ragas.evaluate 4 维打分。
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -984,12 +1039,12 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 它的作用：
-  把 Streamlit 网页背后的核心能力包装成标准 REST API，
+  把 React 前端背后的核心能力包装成标准 REST API，
   让其他程序（前端、脚本、自动化流水线）也能调用。
-  与 main.py 共享同一套核心业务函数。
+  与前端共享同一套核心业务函数。
 
 像五岁小孩理解的那样：
-  Streamlit 像一个商店的橱窗，人只能走进来逛；
+  React 前端像一个商店的橱窗，人只能走进来逛；
   FastAPI 像商店的电话订购热线，别的程序打电话就能下单，
   不用亲自来人。
 
@@ -1023,15 +1078,18 @@
      └────────────────────────────────────────────────┘
      直接传文本字符串入库，适合已有结构化文本的场景。
 
-  5. POST /api/evaluate  [RAGAS 评估]（新增）
+  5. POST /api/evaluate  [轻量评估]（新增）
      ┌────────────────────────────────────────────────┐
-     │  请求：{"sample_size": 5}                     │
-     │  响应：{"faithfulness": 0.85,                  │
-     │         "answer_relevancy": 0.92,              │
-     │         "context_precision": 0.78,            │
-     │         "context_recall": 0.81}               │
+     │  请求：{"k": 10, "threshold": 0.7}（可选）     │
+     │  响应：{"metrics": {                           │
+     │           "recall_at_k": 0.80,                 │
+     │           "faithfulness": 0.85,                │
+     │           "answer_relevancy": 0.92},           │
+     │         "sample_count": 5,                     │
+     │         "summary": "...",                      │
+     │         "report_path": "data/eval_reports/..."}│
      └────────────────────────────────────────────────┘
-     触发 evaluation.py 自动生成数据集 + 跑 4 维打分。
+     基于人工黄金集触发轻量评估（recall@k + LLM-as-judge）。
      离线调用，judge LLM 有成本，不适合高频触发。
 
 启动方式：
@@ -1051,8 +1109,8 @@
 
 工具            | 角色                     | 类比（五岁小孩）
 ─────────────────────────────────────────────────────────────────────────────────
-Gemini 2.0 Flash| AI 大脑（LLM）           | 写答案的聪明小孩
-Gemini Embed 001| 语义 → 数字              | 翻译成秘密数字语言
+智谱 GLM-4      | AI 大脑（LLM）           | 写答案的聪明小孩
+智谱 embedding-3| 语义 → 数字              | 翻译成秘密数字语言（1024 维）
 BM25 / FastEmbed| 关键词匹配               | 在书籍索引中找精确词汇
 Qdrant Cloud    | 向量数据库               | 数字代码的魔法文件柜
 BAAI Reranker   | 深度结果评分             | 老师给每个答案打 1-10 分
@@ -1060,15 +1118,14 @@ LangGraph       | 智能体编排               | 智能体接力赛的跑道
 LangSmith       | 追踪与监控               | 每个智能体步骤的监控摄像头
 Tavily          | 实时网络搜索             | 派人去互联网
 MCP Server      | AI 工具协议              | AI 系统之间的共享工具箱
-Docling         | PDF/DOCX 阅读器          | 文档的超级快速阅读器
-Streamlit       | 网络 UI                  | 商店窗户
-Neo4j Aura      | 知识图谱                  | 跨页面的人物关系网
-RAGAS           | RAG 量化评估              | 给 RAG 系统打分的年检员
+PyMuPDF+zipfile | PDF/DOCX 阅读器          | 文档的超级快速阅读器（Docling 可选增强）
+React+Vite      | 网络 UI                  | 商店窗户
+Neo4j Aura      | 知识图谱（已移除）        | 跨页面的人物关系网（2026-09 已删除，仅历史参考）
+轻量评估        | RAG 量化评估              | 给 RAG 系统打分的年检员（黄金集+recall@k+LLM-as-judge）
 FastAPI         | REST API 接口             | 让别的程序能电话下单
 SQLite          | 记忆数据库               | 记住对话的笔记本
 Docker          | 应用容器                 | 任何地方都能用的午餐盒
 GitHub Actions  | 自动部署流水线           | 你推送代码时部署的机器人
-Render/Streamlit| 免费云托管               | 互联网上的免费店面
 pydantic        | 数据验证                 | 在门口检查身份的保镖
 pytest          | 自动化测试               | 代码的质量检查员
 
@@ -1116,7 +1173,8 @@ pytest          | 自动化测试               | 代码的质量检查员
 
 概念 8: 分块
   文档太大，AI 无法一次阅读。
-  解决方案：将文档分成 1,000 字符的片段，带 200 字符的重叠。
+  解决方案：将文档分成 400 字符的片段，带 40 字符的重叠，
+  并按标题（header-aware）切分。
   重叠防止在文本块边界丢失语义。
   就像：逐章阅读一本书，每章开头提醒上一章的内容。
 
@@ -1129,27 +1187,33 @@ pytest          | 自动化测试               | 代码的质量检查员
   git clone https://github.com/avinash1041/multi-agent-hybrid-rag.git
   cd multi-agent-hybrid-rag
 
-步骤 2 — 获取 API 密钥（4 必填 + 1 选填）
-  A. Google Gemini:  aistudio.google.com/apikey         → GOOGLE_API_KEY
+步骤 2 — 获取 API 密钥（只需 4 个）
+  A. 智谱 GLM:       bigmodel.cn → 控制台             → ZHIPUAI_API_KEY
   B. LangSmith:      smith.langchain.com → 设置         → LANGCHAIN_API_KEY
   C. Qdrant Cloud:   cloud.qdrant.io → 创建集群        → QDRANT_URL + QDRANT_API_KEY
   D. Tavily:         tavily.com → 仪表板                → TAVILY_API_KEY
-  E. Neo4j Aura:     neo4j.com/cloud → 新建实例（选填）  → NEO4J_URI + USERNAME + PASSWORD
-     （不填则 KG 检索自动跳过，向量检索不受影响）
+  （无需 Neo4j：知识图谱已在 2026-09 重构中移除）
 
 步骤 3 — 配置
   cp .env.example .env
-  （打开 .env 并粘贴你的 API 密钥；
-   想用 KG 就把 USE_KG_RETRIEVAL=true，否则设为 false）
+  （打开 .env 并粘贴你的 4 个 API 密钥；
+   其余参数如 CHUNK_SIZE=400 / CHUNK_OVERLAP=40 保持默认即可）
 
-步骤 4 — 安装并运行（两种入口二选一）
+步骤 4 — 安装并运行（前后端分离）
 
-  方式 A：Streamlit 网页
+  方式 A：React 前端 + FastAPI 后端（推荐）
+  # 后端
   pip install -r requirements.txt
-  streamlit run app/main.py
-  打开：http://localhost:8501
+  uvicorn app.api:app --reload --port 8000
+  # 前端（另开终端）
+  cd frontend && npm install && npm run dev
+  打开：http://localhost:5173（自动代理 /api 到 8000）
+        http://localhost:8000/docs 看 OpenAPI 自动文档
+        http://localhost:8000/api/health 看健康检查
+  # 生产模式：npm run build 后，FastAPI 自动托管 frontend/dist
+  直接访问 http://localhost:8000 即可
 
-  方式 B：FastAPI REST 接口
+  方式 B：仅 FastAPI REST 接口
   pip install -r requirements.txt
   uvicorn app.api:app --reload --port 8000
   打开：http://localhost:8000/docs 看 OpenAPI 自动文档
@@ -1164,39 +1228,28 @@ pytest          | 自动化测试               | 代码的质量检查员
              -H "Content-Type: application/json" \
              -d '{"query":"摘要要点"}'
 
-步骤 6 — 跑 RAGAS 量化评估（可选）
+步骤 6 — 跑轻量评估（可选）
+  → 前置：先准备人工黄金集 data/golden_set.json
   → 命令行：python -m app.rag.evaluation
   → API：  curl -X POST http://localhost:8000/api/evaluate \
                -H "Content-Type: application/json" \
-               -d '{"sample_size":5}'
-  → 会自动生成评估数据集 + 跑 4 维打分
-     （faithfulness / answer_relevancy / context_precision / context_recall）
-  → judge LLM 用 Gemini 有成本，离线批量跑，别高频触发
+               -d '{"k":10,"threshold":0.7}'
+  → 输出 3 个指标：recall_at_k / faithfulness / answer_relevancy
+  → 报告自动保存到 data/eval_reports/eval_<时间戳>.json
+  → judge LLM 用智谱 GLM-4 有成本，离线批量跑，别高频触发
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  第 9 部分 — 免费部署选项
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-选项 A — Streamlit Cloud（最简单，推荐）
-  1. 将代码推送到 GitHub
-  2. 访问 share.streamlit.io
-  3. 连接你的 GitHub 仓库
-  4. 设置 app/main.py 为入口点
-  5. 添加密钥（从 .env 复制）
-  6. 点击部署！
-  你的应用获得一个公共 URL，如：yourname.streamlit.app
-
-选项 B — Render.com（更多控制）
+选项 A — Render.com（最简单，推荐）
   1. render.com → 新建 Web 服务 → 连接 GitHub
-  2. 构建命令：pip install -r requirements.txt
-  3. 启动命令：streamlit run app/main.py --server.port $PORT --server.address 0.0.0.0
-  4. 添加环境变量
+  2. 构建命令：pip install -r requirements.txt && cd frontend && npm install && npm run build
+  3. 启动命令：uvicorn app.api:app --host 0.0.0.0 --port $PORT
+  4. 添加环境变量（从 .env 复制）
   5. 部署！
-
-选项 C — 本地 Docker
-  docker-compose up -d
-  打开：http://localhost:8501
+  FastAPI 会自动托管 frontend/dist，访问根域名即可看到 UI。
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1207,18 +1260,18 @@ pytest          | 自动化测试               | 代码的质量检查员
   代码总行数：        约 2,000+ 行
   智能体：             5 个（监督者、RAG、网络、综合、批判）
   MCP 工具：           5 个（hybrid_search、web_search、summarise、entities、calc）
-  测试用例：           12 个自动化测试
+  测试用例：           23 个自动化测试
   使用的技术：         18+ 种现代 AI/ML 工具
-  月度成本：           $0（100% 免费套餐，Neo4j Aura 免费层 200K 节点）
+  月度成本：           $0（100% 免费套餐，智谱 GLM-4-Flash 免费层 + Qdrant Cloud 免费层）
   响应时间：           每次查询约 4-8 秒
   支持的文件类型：     PDF、DOCX、TXT、Markdown
-  部署选项：           Streamlit Cloud、Render、Railway、HuggingFace、Docker
-  接口入口：           Streamlit UI + FastAPI REST（5 个端点含 evaluate）
+  部署选项：           Render、Railway、HuggingFace、Docker
+  接口入口：           React UI + FastAPI REST（含 SSE 流式查询与 evaluate）
 
   这向雇主证明了什么：
   ✅ 你可以构建生产级 AI 系统，而不仅仅是教程
   ✅ 你理解 RAG、智能体、向量数据库和可观测性
-  ✅ 你掌握了知识图谱多跳检索（Neo4j）和量化评估（RAGAS）
+  ✅ 你掌握了双路混合检索（dense+sparse RRF + 重排）和轻量评估（黄金集+recall@k+LLM-as-judge）
   ✅ 你能输出可集成的 REST API（FastAPI），不只是网页 demo
   ✅ 你遵循软件工程最佳实践（测试、CI/CD、Docker）
   ✅ 你能架构多组件分布式系统

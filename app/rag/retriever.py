@@ -1,9 +1,8 @@
 """
 OmniRAG — 混合检索器
 ──────────────────────────
-三路混合召回：Dense（智谱 embedding）+ Sparse（BM25）→ 倒数秩融合
-+ KG（Neo4j 知识图谱多跳检索）→ Cross-Encoder 重排序。
-支持通过 LLM 提取结构化过滤器进行元数据过滤。
+双路混合召回：Dense（智谱 embedding）+ Sparse（BM25）→ 倒数秩融合
++ Cross-Encoder 重排序。支持通过 LLM 提取结构化过滤器进行元数据过滤。
 """
 
 import hashlib
@@ -19,7 +18,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import settings
 from app.rag.ingestion import get_vector_store
-from app.rag.kg import kg_retrieve
 from app.rag.reranker import CrossEncoderReranker
 
 logger = logging.getLogger(__name__)
@@ -56,18 +54,16 @@ FILTER_PROMPT = ChatPromptTemplate.from_messages([
 
 class HybridRetriever(BaseRetriever):
     """
-    三路混合检索器：
+    双路混合检索器：
     1. LLM 从查询中提取元数据过滤器
     2. 在 Qdrant 上进行混合搜索（dense + sparse RRF）
-    3. KG 知识图谱多跳检索（Neo4j）—— 与向量路并行，结果合并
-    4. 对候选结果进行 Cross-encoder 重排序
+    3. 对候选结果进行 Cross-encoder 重排序
     """
 
     top_k: int = Field(default_factory=lambda: settings.retrieval_top_k)
     reranker_top_n: int = Field(default_factory=lambda: settings.reranker_top_n)
     use_reranking: bool = True
     use_filter_extraction: bool = True
-    use_kg: bool = Field(default_factory=lambda: settings.use_kg_retrieval)
     use_multi_query: bool = Field(default_factory=lambda: settings.use_multi_query)
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -85,7 +81,6 @@ class HybridRetriever(BaseRetriever):
                 reranker_top_n=self.reranker_top_n,
                 use_reranking=self.use_reranking,
                 use_filter_extraction=self.use_filter_extraction,
-                use_kg=self.use_kg,
                 use_multi_query=False,  # 防止递归
             )
             mq = MultiQueryRetriever(base, num_queries=settings.multi_query_count)
@@ -106,19 +101,6 @@ class HybridRetriever(BaseRetriever):
 
         candidates = vs.similarity_search(query, **search_kwargs)
         logger.info("通过混合检索检索到 %d 个候选结果。", len(candidates))
-
-        # ── 步骤 2b：知识图谱多跳检索（与向量路并行）────────────
-        if self.use_kg:
-            kg_docs = kg_retrieve(query, top_k=settings.kg_top_k)
-            if kg_docs:
-                # 去重：按 page_content MD5 合并（内置 hash 受 PYTHONHASHSEED 影响，不可靠）
-                seen = {hashlib.md5(d.page_content.encode()).hexdigest() for d in candidates}
-                for d in kg_docs:
-                    key = hashlib.md5(d.page_content.encode()).hexdigest()
-                    if key not in seen:
-                        candidates.append(d)
-                        seen.add(key)
-                logger.info("合并 KG 检索结果后候选数：%d", len(candidates))
 
         if not candidates:
             return []

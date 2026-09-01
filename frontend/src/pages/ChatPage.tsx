@@ -350,7 +350,6 @@ export function ChatPage({ config }: { config: AppConfig | null }) {
         </div>
         <p className="mx-auto mt-2 max-w-3xl text-center text-[11px] text-muted-foreground/60">
           {config ? `模型 ${config.model} · 检索 Top-${config.retrieval_top_k} → 重排 Top-${config.reranker_top_n}` : ""}
-          {config?.use_kg ? " · 知识图谱已开启" : ""}
           {config?.use_multi_query ? " · 多查询扩展已开启" : ""}
           {" · 答案由 AI 生成,请核验关键信息"}
         </p>

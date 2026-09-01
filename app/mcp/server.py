@@ -150,8 +150,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 async def _hybrid_search(query: str, top_k: int = 5) -> list[TextContent]:
     try:
+        from app.config import settings
         from app.rag.retriever import HybridRetriever
-        retriever = HybridRetriever(reranker_top_n=top_k)
+
+        # top_k 语义修正：候选池取 max(top_k, 默认值)，最终返回重排后的 top_k
+        retriever = HybridRetriever(
+            top_k=max(top_k, settings.retrieval_top_k),
+            reranker_top_n=top_k,
+        )
         docs = retriever.invoke(query)
         if not docs:
             return [TextContent(type="text", text="未找到相关文档。")]

@@ -1,24 +1,23 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { toast } from "sonner"
 import { Activity, CheckCircle2, FileBarChart2, FlaskConical, Loader2, Play } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { runEval, type EvalResult } from "@/lib/api"
 
 const METRICS: { key: string; label: string; desc: string; tint: string }[] = [
-  { key: "faithfulness", label: "Faithfulness", desc: "答案忠于上下文,无幻觉", tint: "bg-emerald-500" },
-  { key: "answer_relevancy", label: "Answer Relevancy", desc: "答案切题程度", tint: "bg-primary" },
-  { key: "context_precision", label: "Context Precision", desc: "检索上下文精炼度", tint: "bg-violet-500" },
-  { key: "context_recall", label: "Context Recall", desc: "检索上下文召回率", tint: "bg-cyan-500" },
+  { key: "recall_at_k", label: "Recall@k", desc: "检索是否召回了 ground truth 所在内容", tint: "bg-cyan-500" },
+  { key: "faithfulness", label: "Faithfulness", desc: "答案忠于检索上下文,无幻觉", tint: "bg-emerald-500" },
+  { key: "answer_relevancy", label: "Answer Relevancy", desc: "答案切题程度", tint: "bg-violet-500" },
 ]
 
-function MetricCard({ label, desc, value, tint }: { label: string; desc: string; value?: number; tint: string }) {
-  const pct = value !== undefined ? Math.round(value * 100) : null
+function MetricCard({ label, desc, value, tint }: { label: string; desc: string; value?: number | null; tint: string }) {
+  const pct = value != null && Number.isFinite(value) ? Math.round(value * 100) : null
   return (
     <Card className="border-border/60 bg-card/60 backdrop-blur-sm">
       <CardContent className="p-5">
@@ -42,23 +41,33 @@ function MetricCard({ label, desc, value, tint }: { label: string; desc: string;
 }
 
 export function EvalPage() {
-  const [sampleCount, setSampleCount] = useState("5")
+  const [k, setK] = useState("10")
+  const [threshold, setThreshold] = useState("0.7")
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState<EvalResult | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [elapsed, setElapsed] = useState(0)
+
+  // 评估中实时显示已用时长
+  useEffect(() => {
+    if (!running) return
+    const start = performance.now()
+    const id = setInterval(() => setElapsed((performance.now() - start) / 1000), 500)
+    return () => clearInterval(id)
+  }, [running])
 
   async function handleRun() {
     setRunning(true)
+    setElapsed(0)
     setError(null)
     setResult(null)
-    const started = performance.now()
     try {
-      const res = await runEval(Number(sampleCount))
+      const res = await runEval(Number(k) || undefined, Number(threshold) || undefined)
       if (res.error) {
         setError(res.error)
       } else {
         setResult(res)
-        toast.success(`评估完成,耗时 ${((performance.now() - started) / 1000).toFixed(1)}s`)
+        toast.success(`评估完成,耗时 ${elapsed.toFixed(1)}s`)
       }
     } catch (e) {
       setError(String(e))
@@ -70,9 +79,9 @@ export function EvalPage() {
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <header className="border-b border-border/50 px-6 py-4 backdrop-blur-sm">
-        <h1 className="text-lg font-semibold tracking-tight">RAGAS 质量评估</h1>
+        <h1 className="text-lg font-semibold tracking-tight">质量评估</h1>
         <p className="text-xs text-muted-foreground">
-          自动生成评测样本 → 完整管道推理 → RAGAS 四维指标量化,报告自动存档至 data/eval_reports
+          人工黄金集 → 检索 recall@k + LLM-as-judge 打分,报告自动存档至 data/eval_reports
         </p>
       </header>
 
@@ -85,28 +94,40 @@ export function EvalPage() {
                 <FlaskConical className="h-4 w-4 text-primary" />
                 运行评估
               </CardTitle>
-              <CardDescription>评测会调用完整多 Agent 管道与 RAGAS judge,样本越多耗时越长</CardDescription>
+              <CardDescription>评估会调用完整多 Agent 管道 + 检索 + LLM judge,样本越多耗时越长</CardDescription>
             </CardHeader>
             <CardContent className="flex flex-wrap items-end gap-3">
               <div className="space-y-1.5">
-                <Label>样本数量</Label>
-                <Select value={sampleCount} onValueChange={setSampleCount}>
-                  <SelectTrigger className="w-32">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {["3", "5", "10", "20"].map((n) => (
-                      <SelectItem key={n} value={n}>
-                        {n} 条
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <Label>Recall Top-k</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  value={k}
+                  onChange={(e) => setK(e.target.value)}
+                  className="w-28"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label>召回阈值</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={threshold}
+                  onChange={(e) => setThreshold(e.target.value)}
+                  className="w-28"
+                />
               </div>
               <Button onClick={() => void handleRun()} disabled={running} className="gap-2">
                 {running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-                {running ? "评估中…" : "开始评估"}
+                {running ? `评估中… ${elapsed.toFixed(0)}s` : "开始评估"}
               </Button>
+              {running && (
+                <span className="flex items-center gap-1.5 text-xs text-muted-foreground animate-pulse">
+                  正在跑黄金集 → 多 Agent 管道推理 → 检索召回与 LLM 打分,请勿离开页面
+                </span>
+              )}
               {result?.report_path && (
                 <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <FileBarChart2 className="h-3.5 w-3.5 text-emerald-400" />
@@ -122,7 +143,7 @@ export function EvalPage() {
 
           {/* 指标 */}
           {result && (
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {METRICS.map((m) => (
                 <MetricCard key={m.key} label={m.label} desc={m.desc} value={result.metrics[m.key]} tint={m.tint} />
               ))}
@@ -142,9 +163,10 @@ export function EvalPage() {
                 <Table>
                   <TableHeader>
                     <TableRow className="hover:bg-transparent">
-                      <TableHead className="w-1/3">问题</TableHead>
-                      <TableHead className="w-1/3">标准答案</TableHead>
+                      <TableHead className="w-1/4">问题</TableHead>
+                      <TableHead className="w-1/4">标准答案</TableHead>
                       <TableHead>生成答案</TableHead>
+                      <TableHead className="text-right">召回</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -153,6 +175,11 @@ export function EvalPage() {
                         <TableCell className="text-xs leading-relaxed">{s.query}</TableCell>
                         <TableCell className="text-xs leading-relaxed text-muted-foreground">{s.ground_truth}</TableCell>
                         <TableCell className="text-xs leading-relaxed text-muted-foreground">{s.answer}</TableCell>
+                        <TableCell className="text-right">
+                          <span className={cn("text-xs font-medium", s.recall_hit ? "text-emerald-400" : "text-red-400")}>
+                            {s.recall_hit ? "命中" : "未命中"}
+                          </span>
+                        </TableCell>
                       </TableRow>
                     ))}
                   </TableBody>

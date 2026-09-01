@@ -1,110 +1,91 @@
 # OmniRAG — 多智能体混合研究平台
 
-一个把 **混合检索 RAG** 与 **多智能体编排** 结合的研究助手：监督者路由查询，RAG 知识库与实时网络双源检索（真正并行），综合 Agent 生成答案，评审 Agent 校验并**携带反馈迭代修订**，全程 LangSmith 可观测，并用 RAGAS 做量化评估。
-
-> 技术定位：演示级 MVP，代码结构清晰、可自行部署，适合作为学习与面试作品项目。
-
-## 特性
-
-- **监督者路由**：LangGraph 状态机把查询路由到知识库 / 网络 / 双源并行
-- **混合检索**：Dense（智谱 embedding）+ Sparse（BM25）双路向量，RRF 融合，Cross-Encoder（bge-reranker）重排，可选多查询扩展（Multi-Query）
-- **知识图谱**：Neo4j 实体关系抽取 + 关键词多跳检索（中文用 jieba 分词），可选开关
-- **真正的评估-修订闭环**：评审 Agent 的 REVISE 反馈会传回综合 Agent，逐条修订后再评审，直到 GOOD 或达到最大轮数
-- **真并行**：RAG 与 Web 检索通过 asyncio 并发执行
-- **对话记忆**：SQLite checkpoint 持久化，监督者与综合 Agent 都能看到最近对话
-- **流式执行**：SSE 实时推送 路由 → 检索 → 综合 → 评审 的每一步
-- **量化评估**：RAGAS 四指标（Faithfulness / Answer Relevancy / Context Precision / Recall），评测报告自动存档
-- **高级感前端**：React 19 + TypeScript + Tailwind CSS v4 + shadcn/ui
-- **可观测**：LangSmith 全链路追踪
+基于 LangGraph 的多 Agent RAG 系统：监督者路由 → 混合检索（dense + BM25 稀疏 + cross-encoder 重排）→ 综合 → 自评审闭环。自带 FastAPI REST/SSE 接口、React 19 前端、MCP Server 与轻量量化评估（黄金集 + 检索 recall@k + LLM-as-judge）。
 
 ## 架构
 
 ```
-React (shadcn/ui)  ──SSE──▶  FastAPI  ──▶  LangGraph 工作流
-        ▲                        │              │
-        │                        │              ▼
-        └── /api/query/stream ◀──┘        监督者（路由）
-                                              │
-                              ┌───────────────┼───────────────┐
-                              ▼               ▼               ▼
-                          RAG Agent       Web Agent     双源并行
-                       (混合检索+重排)   (Tavily)     (asyncio.gather)
-                              └───────────────┼───────────────┘
-                                              ▼
-                                        综合 Agent
-                                     （携带评审反馈修订）
-                                              ▼
-                                        评审 Agent
-                                     GOOD? ──否──▶ 回到综合
-                                              │是
-                                              ▼
-                                    最终答案 + 来源引用
+                        ┌────────────┐
+  用户查询 ─────────────►│ supervisor │  (监督者路由)
+                        └─────┬──────┘
+              rag_agent / web_agent / both
+                        ┌─────┴──────┐
+                        │  rag_node  │──► Qdrant 混合检索
+                        │  web_node  │──► Tavily 网页搜索
+                        │ both_node  │     (asyncio.gather 并行)
+                        └─────┬──────┘
+                              ▼
+                        ┌────────────┐
+                        │ synthesis  │  综合 RAG+Web 上下文生成答案
+                        └─────┬──────┘
+                              ▼
+                        ┌────────────┐
+                        │ critique   │  评审（忠实性/完整性/准确性/清晰度）
+                        └─────┬──────┘
+                   PASS / 达上限 ─────► 输出 final_answer
+                   REVISE ────────────► 携带反馈回到 synthesis
 ```
 
-## 技术栈
+检索链路（`app/rag/retriever.py`）：
 
-| 层级 | 技术 |
-|---|---|
-| LLM / Embeddings | 智谱 GLM-4-Flash、embedding-3 |
-| 混合检索 | Qdrant（dense + sparse）、FastEmbed BM25、RRF 融合 |
-| 重排 | BAAI/bge-reranker-base（本地） |
-| 知识图谱 | Neo4j + jieba 分词 |
-| 编排 | LangGraph（异步节点） |
-| 记忆 | SQLite checkpoint |
-| 可观测性 | LangSmith |
-| 评估 | RAGAS |
-| Web 搜索 | Tavily |
-| 后端 | FastAPI + SSE |
-| 前端 | React 19 + Vite + TypeScript + Tailwind CSS v4 + shadcn/ui |
-| 部署 | Docker / docker-compose |
+```
+Dense(智谱 embedding-3)  ┐
+                         ├─ RRF 融合 ─► Cross-Encoder ─► top-N
+Sparse(FastEmbed BM25)   ┘             (bge-reranker-base)
+```
+
+## 特性
+
+- **监督者多 Agent 工作流**：LLM 路由到 知识库/网络/双路并行/直接综合，双路检索真正并行（`asyncio.gather`）
+- **混合检索**：dense + sparse 倒数秩融合 + 本地 cross-encoder 重排，支持 LLM 提取元数据过滤器与多查询扩展
+- **自评审闭环**：评审 Agent 的 REVISE 反馈传回综合 Agent 迭代修订，默认最多 5 轮，可通过 `MAX_ITERATIONS` 调整
+- **对话记忆**：LangGraph SQLite checkpoint，同一 `thread_id` 延续上下文
+- **接口完整**：FastAPI REST + SSE 流式事件（路由/检索/综合/评审逐步可见）、文件/文本导入、知识库统计、MCP Server
+- **轻量评估**：人工黄金集 + 检索 recall@k + LLM-as-judge（faithfulness / answer_relevancy），不依赖 ragas/datasets/pyarrow
+- **LangSmith 可观测**：全链路追踪
+- **国内网络适配**：自动读取系统代理、Qdrant 走代理 patch、HF 镜像、多级文档解析降级
 
 ## 快速开始
 
-### 1. 配置环境变量
+前置依赖：Python 3.10+、Node 18+、一个智谱 GLM API Key（免费额度的 `glm-4-flash` / `embedding-3` 即可）、Qdrant Cloud 免费实例、Tavily 免费 Key。
 
 ```bash
-cp .env.example .env
-```
-
-至少需要填写：`ZHIPUAI_API_KEY`、`LANGCHAIN_API_KEY`、`QDRANT_URL`、`QDRANT_API_KEY`、`TAVILY_API_KEY`。知识图谱相关的 `NEO4J_*` 与 `USE_KG_RETRIEVAL` 可选，默认关闭。
-
-### 2. 安装后端依赖
-
-```bash
-python -m venv .venv
-.venv/Scripts/activate        # Windows
+# 1. 后端
+cp .env.example .env          # 填入 ZHIPUAI_API_KEY / LANGCHAIN_API_KEY / QDRANT_* / TAVILY_API_KEY
 pip install -r requirements.txt
-```
-
-PDF/DOCX 解析依赖 Docling，镜像源 403 时手动安装：`pip install docling`（不装也能用 TXT/MD/文本导入）。
-
-### 3. 启动后端
-
-```bash
 uvicorn app.api:app --reload --port 8000
-```
 
-### 4. 启动前端（开发模式）
-
-需要 Node.js 18+：
-
-```bash
-cd frontend
-npm install
-npm run dev        # http://localhost:5173，自动代理 /api 到 8000
-```
-
-生产模式：`npm run build` 后，FastAPI 会自动托管 `frontend/dist`，直接访问 `http://localhost:8000` 即可。
-
-### 5. 导入文档
-
-```bash
-python scripts/ingest.py --file docs/report.pdf
+# 2. 导入文档（任一）
+python scripts/ingest.py --file docs/你的文档.pdf
 python scripts/ingest.py --dir ./my_docs
 python scripts/ingest.py --text "要导入的文本" --label "我的资料"
+# 或 curl:
+curl -X POST -F "file=@你的文档.pdf" http://localhost:8000/api/ingest/file
+
+# 3. 前端
+cd frontend
+npm install
+npm run dev                   # 开发模式，自动代理 /api 到 8000
+
+# 生产模式（前端构建后由 FastAPI 同源托管）
+npm run build
 ```
 
-也可以在界面的「知识库」页面上传文件或粘贴文本。
+## 环境变量
+
+见 `.env.example`。核心项：
+
+| 变量 | 说明 |
+| --- | --- |
+| `ZHIPUAI_API_KEY` | 智谱 GLM Key（LLM + embedding） |
+| `ZHIPU_MODEL` | 默认 `glm-4-flash` |
+| `ZHIPU_EMBEDDING_MODEL` | 默认 `embedding-3`（1024 维） |
+| `QDRANT_URL` / `QDRANT_API_KEY` | Qdrant Cloud 向量库 |
+| `TAVILY_API_KEY` | Tavily 网页搜索 |
+| `LANGCHAIN_API_KEY` | LangSmith 追踪 |
+| `MAX_ITERATIONS` | 评审闭环最大轮数（默认 5） |
+| `RETRIEVAL_TOP_K` / `RERANKER_TOP_N` | 检索/重排数量 |
+| `EVAL_GOLDEN_PATH` / `EVAL_REPORT_DIR` | 黄金集路径与评估报告目录 |
 
 ## API 一览
 
@@ -117,38 +98,72 @@ python scripts/ingest.py --text "要导入的文本" --label "我的资料"
 | POST | `/api/query/stream` | 流式查询（SSE，逐步推送 Agent 状态） |
 | POST | `/api/ingest/file` | 上传文件导入 |
 | POST | `/api/ingest/text` | 文本导入 |
-| POST | `/api/evaluate` | RAGAS 评估 |
+| POST | `/api/evaluate` | 轻量评估（黄金集 + recall@k + LLM-judge） |
 
-## 测试与质量
+## 评估
+
+评估基于**人工校验的黄金集**（`data/golden_set.json`），而非系统自产自销，避免自引用失真。每个样本计算：
+
+- **recall@k**：检索 top-k 是否召回了 ground truth 相关内容（dense 余弦相似度 ≥ 阈值）
+- **faithfulness**：答案是否忠于检索上下文（LLM 打分 0-1）
+- **answer_relevancy**：答案是否切题（LLM 打分 0-1）
 
 ```bash
-pip install ruff pytest pytest-asyncio
-ruff check app scripts tests
-pytest tests -v
+# CLI 跑评估（需先导入文档并填写黄金集）
+python -m app.rag.evaluation
+
+# 或通过 API
+curl -X POST http://localhost:8000/api/evaluate -H 'Content-Type: application/json' -d '{"k": 10, "threshold": 0.7}'
 ```
 
-当前 23 个单元测试全部通过（重排、路由、评审判定、KG 分词、MCP 工具、检索多查询路径等），不依赖真实 API。
+报告自动存档到 `data/eval_reports/eval_<时间戳>.json`，前端「质量评估」页可视化。
+
+> 黄金集模板：`data/golden_set.json` 内置 3 条示例，请按你实际导入的知识库内容替换与扩充。`query` 必须能从库中检索到答案。
 
 ## 项目结构
 
 ```
 app/
-  graph/workflow.py       # LangGraph 异步工作流（路由/并行/评审闭环/流式事件）
-  agents/                 # 监督者、RAG、Web、综合、评审
-  rag/                    # 混合检索、重排、知识图谱、导入、RAGAS 评估
-  mcp/server.py           # MCP 工具服务器
-  api.py                  # FastAPI 接口 + 前端静态托管
-frontend/                 # React + shadcn/ui 前端
-tests/                    # 单元测试
-data/eval_reports/        # RAGAS 评估报告（自动生成）
+├── api.py               # FastAPI REST + SSE
+├── config.py            # pydantic-settings 集中配置
+├── graph/
+│   └── workflow.py      # LangGraph 状态图（监督者/检索/综合/评审）
+├── agents/              # rag_agent / web_agent / synthesis_agent / critique_agent
+├── rag/
+│   ├── retriever.py     # 混合检索（dense+sparse RRF + 重排）
+│   ├── ingestion.py     # 文档解析→分块→向量化→入库
+│   ├── reranker.py      # bge-reranker-base 重排
+│   └── evaluation.py    # 黄金集 + recall@k + LLM-as-judge
+└── mcp/server.py        # MCP Server（hybrid_search / web_search / …）
+frontend/                # React 19 + Vite + Tailwind + shadcn/ui
+scripts/ingest.py        # CLI 导入工具
+tests/                   # pytest 单元测试（路由/评审/检索格式化/黄金集…）
+data/                    # 向量库 checkpoint、黄金集、评估报告
+Dockerfile               # 多阶段构建（前端 + 后端）
 ```
+
+## 重构说明（2026-09）
+
+- **移除知识图谱（Neo4j）**：原 `kg_retrieve` 为 jieba 关键词 + 一跳邻居，非真正的图推理，且每个 chunk 一次 LLM 实体抽取成本高、收益低。移除后依赖（neo4j/jieba）与安全隐患（`aura_query` 的 `verify=False`）一并消除。
+- **RAGAS → 轻量评估**：RAGAS 依赖 ragas/datasets/pyarrow，存在 pyarrow pickle bug、结果 NaN、judge 与生成同模型的自引用失真。改为人工黄金集 + 检索 recall@k + LLM-as-judge，指标更可信、维护成本更低。
+- **`MAX_ITERATIONS` 参数化**：评估不再修改全局 `settings`（原全局可变状态在并发下会互相踩），而是通过 `run_query(..., max_iterations=...)` 传入。
+
+## 测试与质量
+
+```bash
+pip install -r requirements.txt
+ruff check app tests
+pytest -q
+```
+
+单元测试覆盖：路由判定、评审通过/修订判定、检索上下文格式化、导入去重、MCP 工具、黄金集加载、`max_iterations` 参数化等，不依赖真实 API。
 
 ## 已知限制
 
-- LLM 免费额度有限（GLM-4-Flash 15 RPM），流式查询在双源并行时可能触发限流，重试即可
-- RAGAS 评估跑完整管道，样本多时耗时较长，建议先用 3-5 条样本
+- LLM 免费额度有限（GLM-4-Flash 有 RPM 限制），双源并行时可能触发限流，重试即可
+- `langchain-community` 的智谱 embedding 集成已标记弃用，官方 `langchain-zhipuai` 包在部分镜像源不可用，待其可用后迁移
 - API 未加鉴权与限流，仅适合本地/内网演示
-- `langchain-community` 的智谱 embedding 集成已标记弃用，官方 `langchain-zhipuai` 包在部分镜像源还是空壳，待其可用后迁移
+- Docker 部署时重排模型（bge-reranker-base）与文档解析依赖（poppler/tesseract）体积较大，首次拉取较慢
 
 ## License
 

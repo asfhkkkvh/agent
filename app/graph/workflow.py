@@ -14,7 +14,8 @@ import asyncio
 import logging
 import os
 import uuid
-from typing import Annotated, List, Literal, TypedDict
+from functools import partial
+from typing import Annotated, List, Literal, Optional, TypedDict
 
 from langchain_community.chat_models import ChatZhipuAI
 from langchain_core.messages import BaseMessage, HumanMessage
@@ -162,8 +163,15 @@ async def synthesis_node(state: AgentState) -> AgentState:
     return {**state, "draft_answer": answer}
 
 
-async def critique_node(state: AgentState) -> AgentState:
-    """评审答案；通过则结束，否则带反馈回到综合节点。"""
+async def critique_node(
+    state: AgentState,
+    max_iterations: Optional[int] = None,
+) -> AgentState:
+    """评审答案；通过则结束，否则带反馈回到综合节点。
+
+    max_iterations 通过 build_graph 注入（见 build_graph），
+    不修改全局 settings，避免并发请求互相影响。
+    """
     agent = create_critique_agent()
     critique = await asyncio.to_thread(
         agent.evaluate,
@@ -172,8 +180,9 @@ async def critique_node(state: AgentState) -> AgentState:
         state.get("rag_context", "") + "\n" + state.get("web_context", ""),
     )
     iterations = state.get("iterations", 0) + 1
+    limit = max_iterations if max_iterations is not None else settings.max_iterations
     passed = _critique_passed(critique)
-    if passed or iterations >= settings.max_iterations:
+    if passed or iterations >= limit:
         final = state["draft_answer"]
     else:
         final = ""
@@ -181,7 +190,7 @@ async def critique_node(state: AgentState) -> AgentState:
         "评审结果: %s（第 %d/%d 轮）",
         "PASS" if passed else "REVISE",
         iterations,
-        settings.max_iterations,
+        limit,
     )
     return {
         **state,
@@ -238,7 +247,7 @@ def route_critique(state: AgentState) -> Literal["synthesis_node", "end"]:
 
 # ── 图组装 ─────────────────────────────────────────────────────────────────────
 
-def build_graph(checkpointer=None):
+def build_graph(checkpointer=None, max_iterations: Optional[int] = None):
     graph = StateGraph(AgentState)
 
     graph.add_node("supervisor", supervisor_node)
@@ -246,7 +255,7 @@ def build_graph(checkpointer=None):
     graph.add_node("web_node", web_node)
     graph.add_node("both_node", both_node)
     graph.add_node("synthesis_node", synthesis_node)
-    graph.add_node("critique_node", critique_node)
+    graph.add_node("critique_node", partial(critique_node, max_iterations=max_iterations))
 
     graph.add_edge(START, "supervisor")
 
@@ -292,6 +301,7 @@ def _initial_state(query: str) -> AgentState:
     }
 
 
+
 def _extract_result(result) -> dict:
     return {
         "final_answer": result.get("final_answer") or result.get("draft_answer"),
@@ -303,21 +313,37 @@ def _extract_result(result) -> dict:
     }
 
 
-async def arun_query(query: str, thread_id: str = "default") -> dict:
-    """异步执行完整的多 Agent 管道。"""
+async def arun_query(
+    query: str,
+    thread_id: str = "default",
+    max_iterations: Optional[int] = None,
+) -> dict:
+    """异步执行完整的多 Agent 管道。
+
+    max_iterations 用于覆盖评审闭环轮数（评估时传 1 可关闭循环），
+    不修改全局 settings。async 调用方请使用本函数而非 run_query。
+    """
     db_path = os.path.join(settings.data_dir, "checkpoints.db")
     os.makedirs(settings.data_dir, exist_ok=True)
 
     async with AsyncSqliteSaver.from_conn_string(db_path) as checkpointer:
-        graph = build_graph(checkpointer)
+        graph = build_graph(checkpointer, max_iterations=max_iterations)
         config = {"configurable": {"thread_id": thread_id or str(uuid.uuid4())}}
         result = await graph.ainvoke(_initial_state(query), config=config)
         return _extract_result(result)
 
 
-def run_query(query: str, thread_id: str = "default") -> dict:
-    """同步包装：通过 asyncio.run 执行完整管道。"""
-    return asyncio.run(arun_query(query, thread_id))
+def run_query(
+    query: str,
+    thread_id: str = "default",
+    max_iterations: Optional[int] = None,
+) -> dict:
+    """同步包装：通过 asyncio.run 执行完整管道。
+
+    注意：只能在没有运行中事件循环的上下文调用（如 FastAPI 同步端点、
+    脚本）。若在 async 环境中调用会抛 RuntimeError，请改用 arun_query。
+    """
+    return asyncio.run(arun_query(query, thread_id, max_iterations=max_iterations))
 
 
 def _node_event(node: str, frag: dict) -> dict | None:
@@ -358,7 +384,11 @@ def _node_event(node: str, frag: dict) -> dict | None:
     return None
 
 
-async def stream_query(query: str, thread_id: str = "default"):
+async def stream_query(
+    query: str,
+    thread_id: str = "default",
+    max_iterations: Optional[int] = None,
+):
     """流式执行管道，逐步产出事件字典（供 SSE 使用）。
 
     事件类型：
@@ -375,7 +405,7 @@ async def stream_query(query: str, thread_id: str = "default"):
 
     last_state = None
     async with AsyncSqliteSaver.from_conn_string(db_path) as checkpointer:
-        graph = build_graph(checkpointer)
+        graph = build_graph(checkpointer, max_iterations=max_iterations)
         config = {"configurable": {"thread_id": thread_id}}
 
         async for update in graph.astream(

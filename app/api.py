@@ -63,7 +63,7 @@ from app.config import settings
 
 # 复用工作流与导入模块的同一套核心函数
 from app.graph.workflow import run_query, stream_query
-from app.rag.evaluation import generate_eval_dataset, run_ragas_evaluation
+from app.rag.evaluation import run_evaluation
 from app.rag.ingestion import extract_from_text, ingest_documents, ingest_file
 
 logger = logging.getLogger(__name__)
@@ -122,8 +122,11 @@ class HealthResponse(BaseModel):
 
 
 class EvalRequest(BaseModel):
-    sample_count: Optional[int] = Field(
-        None, description="评测样本数（不传用 settings.eval_dataset_size）"
+    k: Optional[int] = Field(
+        None, description="检索召回评估的 top-k（默认用 RETRIEVAL_TOP_K）"
+    )
+    threshold: Optional[float] = Field(
+        None, description="recall 判定余弦相似度阈值（默认 0.7）"
     )
 
 
@@ -138,7 +141,6 @@ class AppConfigResponse(BaseModel):
     app_title: str
     model: str
     embedding_model: str
-    use_kg: bool
     use_multi_query: bool
     max_iterations: int
     retrieval_top_k: int
@@ -217,7 +219,6 @@ def app_config() -> AppConfigResponse:
         app_title=settings.app_title,
         model=settings.zhipu_model,
         embedding_model=settings.zhipu_embedding_model,
-        use_kg=settings.use_kg_retrieval,
         use_multi_query=settings.use_multi_query,
         max_iterations=settings.max_iterations,
         retrieval_top_k=settings.retrieval_top_k,
@@ -256,7 +257,14 @@ def collection_stats() -> dict:
         }
     except Exception as e:
         logger.warning("读取集合统计失败: %s", e)
-        return {"error": str(e)}
+        # 始终返回完整结构，避免前端拿到缺字段的 200 响应
+        return {
+            "points": None,
+            "sources": {},
+            "content_types": {},
+            "collection": settings.qdrant_collection,
+            "error": str(e),
+        }
 
 
 @app.post("/api/ingest/file", response_model=IngestResponse)
@@ -310,24 +318,21 @@ def ingest_text_endpoint(req: TextIngestRequest) -> IngestResponse:
         raise HTTPException(status_code=500, detail=f"导入失败: {e}")
 
 
-# ── RAGAS 评估 ───────────────────────────────────────────────────────────────
+# ── 轻量评估（黄金集 + LLM-as-judge）──────────────────────────────────────────
 
 @app.post("/api/evaluate", response_model=EvalResponse)
 def evaluate_endpoint(req: EvalRequest) -> EvalResponse:
     """
-    跑一次 RAGAS 端到端评估：
-        1. LLM 自动生成 N 条 (query, ground_truth) 评测样本
-        2. 对每条样本调 run_query 获取 (answer, context)
-        3. RAGAS 输出 4 个指标：
-           - Faithfulness      答案是否忠于上下文
-           - Answer Relevancy  答案是否切题
-           - Context Precision 检索是否精炼
-           - Context Recall    检索是否召回了必要信息
+    跑一次轻量评估（黄金集 + 检索 recall@k + LLM-as-judge）：
+        1. 从 data/golden_set.json 加载人工校验样本
+        2. 对每条样本调 run_query 获取答案 + 检索 top-k 原始 chunk
+        3. 输出 3 个指标：
+           - recall_at_k       检索是否召回了 ground_truth 所在内容
+           - faithfulness      答案是否忠于检索上下文
+           - answer_relevancy  答案是否切题
     """
     try:
-        result = run_ragas_evaluation(
-            samples=generate_eval_dataset(req.sample_count) if req.sample_count else None
-        )
+        result = run_evaluation(k=req.k, threshold=req.threshold or 0.7)
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
         return EvalResponse(

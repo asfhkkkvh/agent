@@ -39,16 +39,6 @@ class Settings(BaseSettings):
     # ── Tavily 网页搜索（免费版）────────────────────────────
     tavily_api_key: str = Field(..., validation_alias="TAVILY_API_KEY")
 
-    # ── Neo4j 知识图谱（Aura 免费云版: https://neo4j.io/aura-free）──
-    neo4j_uri: str = Field("bolt://localhost:7687", validation_alias="NEO4J_URI")
-    neo4j_username: str = Field("neo4j", validation_alias="NEO4J_USERNAME")
-    neo4j_password: str = Field("password", validation_alias="NEO4J_PASSWORD")
-
-    # ── 知识图谱 + RAGAS 评估开关 ────────────────────────────
-    use_kg_retrieval: bool = Field(True, validation_alias="USE_KG_RETRIEVAL")
-    kg_top_k: int = Field(5, validation_alias="KG_TOP_K")
-    eval_dataset_size: int = Field(20, validation_alias="EVAL_DATASET_SIZE")
-
     # ── RAG 检索调优 ─────────────────────────────────────────────
     retrieval_top_k: int = Field(10, validation_alias="RETRIEVAL_TOP_K")
     reranker_top_n: int = Field(5, validation_alias="RERANKER_TOP_N")
@@ -66,12 +56,17 @@ class Settings(BaseSettings):
     max_iterations: int = Field(5, validation_alias="MAX_ITERATIONS")
     agent_temperature: float = Field(0.0, validation_alias="AGENT_TEMPERATURE")
 
-    # ── 应用配置 ──────────────────────────────────────────────
-    app_title: str = "OmniRAG — 多智能体混合研究平台"
-    data_dir: str = "data"
+    # ── 评估（黄金集 + LLM-as-judge）──────────────────────────
+    eval_golden_path: str = Field(
+        "data/golden_set.json", validation_alias="EVAL_GOLDEN_PATH"
+    )
     eval_report_dir: str = Field(
         "data/eval_reports", validation_alias="EVAL_REPORT_DIR"
     )
+
+    # ── 应用配置 ──────────────────────────────────────────────
+    app_title: str = "OmniRAG — 多智能体混合研究平台"
+    data_dir: str = "data"
     log_level: str = Field("INFO", validation_alias="LOG_LEVEL")
 
 

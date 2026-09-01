@@ -1,28 +1,31 @@
 """
-OmniRAG — RAGAS 量化评估模块
-────────────────────────────────────
-使用 RAGAS 框架对 RAG 系统进行端到端评估，输出 4 个核心指标：
-    - Faithfulness        答案是否忠于检索到的上下文
-    - Answer Relevancy    答案是否切题
-    - Context Precision   检索的上下文是否精炼
-    - Context Recall      检索是否召回了必要信息
+OmniRAG — 轻量评估模块（黄金集 + 检索召回 + LLM-as-judge）
+────────────────────────────────────────────
+替代早期基于 RAGAS 的重型评估（依赖 ragas / datasets / pyarrow，
+存在 pyarrow MonthDayNano pickle bug、NaN 结果、judge 与生成同模型
+自引用失真等问题）。
 
-评估流程：
-    1. 从已导入文档自动生成 N 条 (query, ground_truth) 评测对
-    2. 对每条 query 调用 run_query 获取 (answer, context)
-    3. 喂给 RAGAS 跑评估，输出指标 + 单条样本详情
+指标：
+- recall_at_k：检索层指标。对每条黄金样本取回 top-k chunk，用智谱
+  embedding 计算 ground_truth 与各 chunk 的最大余弦相似度，超过阈值
+  记为命中，命中率即 recall@k。直接反映"检索有没有召回该召回的东西"。
+- faithfulness：答案是否忠于检索上下文（LLM 打分 0-1）。
+- answer_relevancy：答案是否切题（LLM 打分 0-1）。
+
+评测集：data/golden_set.json，人工校验的 (query, ground_truth, source)。
+不再由系统自产自销，避免自引用失真。
 """
 
 import json
 import logging
-import random
+import re
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langchain_community.chat_models import ChatZhipuAI
 from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.graph.workflow import run_query
@@ -30,219 +33,220 @@ from app.graph.workflow import run_query
 logger = logging.getLogger(__name__)
 
 
-# ── 评测样本结构 ─────────────────────────────────────────────────────────────
+# ── 黄金集加载 ─────────────────────────────────────────────────────────────
 
-class EvalSample(BaseModel):
-    query: str
-    ground_truth: str
+def load_golden_set(path: Optional[str] = None) -> List[Dict[str, str]]:
+    """加载黄金集 JSON。
 
-
-class EvalDataset(BaseModel):
-    samples: List[EvalSample] = Field(default_factory=list)
-
-
-# ── 评测集自动生成 ───────────────────────────────────────────────────────────
-
-GEN_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """你是 RAG 评测集生成助手。基于给定文档片段，
-生成 {n} 条 (问题, 标准答案) 对用于评估检索增强系统。
-
-要求：
-1. 问题要具体、可从给定文档中找到答案（不要凭空提问）
-2. 标准答案要简洁准确，1-2 句话
-3. 问题类型多样化：事实型 / 比较型 / 推理型 各占一定比例
-4. 返回 JSON 格式"""),
-    ("human", "文档片段：\n{context}"),
-])
-
-
-def _sample_context(n: int) -> str:
-    """从 Qdrant 随机采样一些 chunk 作为生成评测集的素材。
-
-    用 scroll 直接随机读取，而不是用一个固定查询词去相似度检索——
-    后者会把采样结果偏向与"概览/简介"相关的文档。
+    支持两种格式：
+    - 顶层数组：[{"query": ..., "ground_truth": ..., "source": ...}]
+    - 顶层对象：{"_comment": "...", "samples": [...]}（便于加说明字段）
     """
+    path = path or settings.eval_golden_path
+    p = Path(path)
+    if not p.exists():
+        logger.error("黄金集不存在: %s（请先创建或设置 EVAL_GOLDEN_PATH）", path)
+        return []
     try:
-        from app.rag.ingestion import get_qdrant_client
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        logger.error("黄金集 JSON 解析失败: %s", e)
+        return []
 
-        client = get_qdrant_client()
-        records, _ = client.scroll(
-            collection_name=settings.qdrant_collection,
-            limit=max(n * 3, 30),
-            with_payload=True,
-            with_vectors=False,
+    rows = data.get("samples", data) if isinstance(data, dict) else data
+    samples = [
+        {"query": str(s["query"]), "ground_truth": str(s["ground_truth"]),
+         "source": str(s.get("source", ""))}
+        for s in rows
+        if isinstance(s, dict) and s.get("query") and s.get("ground_truth")
+    ]
+    logger.info("加载黄金集 %d 条（%s）", len(samples), path)
+    return samples
+
+
+# ── 检索层：recall@k ───────────────────────────────────────────────────────
+
+def _embed(texts: List[str]):
+    """批量计算智谱 dense 向量（兼容 1 条与多条）。"""
+    from app.rag.ingestion import get_dense_embeddings
+
+    emb = get_dense_embeddings()
+    if len(texts) == 1:
+        return [emb.embed_query(texts[0])]
+    return emb.embed_documents(texts)
+
+
+def _max_cosine(gt_text: str, chunk_texts: List[str]) -> float:
+    """ground_truth 与各 chunk 的最大余弦相似度（向量内积归一化）。"""
+    if not chunk_texts:
+        return 0.0
+    try:
+        import numpy as np
+
+        gt_vec = np.asarray(_embed([gt_text])[0], dtype=float)
+        chunk_vecs = np.asarray(_embed(chunk_texts), dtype=float)
+        gt_norm = np.linalg.norm(gt_vec)
+        if gt_norm == 0:
+            return 0.0
+        sims = (chunk_vecs @ gt_vec) / (
+            np.linalg.norm(chunk_vecs, axis=1) * gt_norm + 1e-9
         )
-        random.shuffle(records)
-        texts = [
-            r.payload.get("page_content", "")
-            for r in records
-            if r.payload and r.payload.get("page_content")
-        ]
-        if not texts:
-            return ""
-        return "\n\n---\n\n".join(t[:800] for t in texts[: n * 2])
+        return float(sims.max())
     except Exception as e:
-        logger.warning("采样文档失败: %s", e)
-        return ""
+        logger.warning("相似度计算失败: %s", e)
+        return 0.0
 
 
-def _retrieve_raw_contexts(query: str, top_k: int = None) -> List[str]:
-    """用检索器取回真实命中的 chunk 原文（评估用的 ground truth 上下文）。
+def _retrieve_top_k(sample: Dict[str, str], k: int) -> List[str]:
+    """用生产检索器取回 top-k 原始 chunk 文本。
 
-    RAGAS 的 Context Precision / Recall 应该衡量"检索到了什么"，
-    因此必须使用原始 chunk，而不是 RAG Agent 二次加工后的摘要。
+    关闭过滤器提取与多查询，保持评估确定性、避免额外 LLM 调用。
     """
     from app.rag.retriever import HybridRetriever
 
     try:
         retriever = HybridRetriever(
-            top_k=top_k or settings.retrieval_top_k,
-            reranker_top_n=settings.reranker_top_n,
+            top_k=k,
+            reranker_top_n=k,  # recall@k 针对重排后的 top-k 计算
+            use_filter_extraction=False,
+            use_multi_query=False,
         )
-        docs = retriever.invoke(query)
+        docs = retriever.invoke(sample["query"])
         return [d.page_content for d in docs]
     except Exception as e:
-        logger.warning("检索原始上下文失败 (%s): %s", query[:30], e)
+        logger.warning("检索失败 (%s): %s", sample["query"][:30], e)
         return []
 
 
-def generate_eval_dataset(n: int = None) -> List[EvalSample]:
-    """用 LLM 从已导入文档自动生成 N 条评测样本。"""
-    n = n or settings.eval_dataset_size
-    context = _sample_context(n)
-    if not context:
-        logger.error("无法从向量库采样文档，请先导入文档。")
-        return []
+# ── LLM-as-judge ────────────────────────────────────────────────────────────
 
+JUDGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """你是严格的 RAG 质量评估员。根据给定上下文，对模型回答打分。
+
+打分标准（0-100 整数）：
+- faithfulness：回答中的关键论断是否都有上下文支撑（无幻觉）。
+  完全支撑=90-100，部分支撑=50-80，明显编造=0-30。
+- answer_relevancy：回答是否切题、完整覆盖了问题。
+  完全切题=90-100，部分=50-80，答非所问=0-30。
+
+只输出一行 JSON：{{"faithfulness": <0-100>, "answer_relevancy": <0-100>}}
+不要输出任何其他文字或 markdown 代码块。"""),
+    ("human", """问题: {query}
+
+检索到的上下文:
+{context}
+
+模型回答:
+{answer}
+
+打分:"""),
+])
+
+
+def _judge(query: str, answer: str, contexts: List[str]) -> Dict[str, float]:
+    """LLM 打分，返回 0-1 的 (faithfulness, answer_relevancy)；失败返回空 dict。"""
+    if not answer or not answer.strip():
+        return {"faithfulness": 0.0, "answer_relevancy": 0.0}
     llm = ChatZhipuAI(
         model=settings.zhipu_model,
         zhipuai_api_key=settings.zhipuai_api_key,
-        temperature=0.4,
+        temperature=0,
     )
-    structured_llm = llm.with_structured_output(EvalDataset)
-    chain = GEN_PROMPT | structured_llm
+    chain = JUDGE_PROMPT | llm
+    context = "\n\n---\n\n".join(contexts)[:4000] if contexts else "（无上下文）"
     try:
-        result: EvalDataset = chain.invoke({"n": n, "context": context})
-        samples = result.samples[:n]
-        logger.info("生成 %d 条评测样本。", len(samples))
-        return samples
+        resp = chain.invoke({
+            "query": query,
+            "context": context,
+            "answer": (answer or "")[:2000],
+        })
+        content = resp.content if hasattr(resp, "content") else str(resp)
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if not m:
+            logger.warning("judge 输出无法解析: %s", content[:100])
+            return {}
+        data = json.loads(m.group(0))
+        return {
+            "faithfulness": float(data.get("faithfulness", 0)) / 100.0,
+            "answer_relevancy": float(data.get("answer_relevancy", 0)) / 100.0,
+        }
     except Exception as e:
-        logger.error("评测集生成失败: %s", e)
-        return []
+        logger.warning("judge 打分失败: %s", e)
+        return {}
 
 
-# ── RAGAS 端到端评估 ──────────────────────────────────────────────────────────
+# ── 主流程 ──────────────────────────────────────────────────────────────────
 
-def _build_ragas_dataset(samples: List[EvalSample]) -> Any:
-    """构造 RAGAS 输入数据集：对每条样本跑一次完整管道获取答案，
-    同时用检索器取回原始 chunk 作为评估上下文。"""
-    from datasets import Dataset
+def _fmt(v: Optional[float]) -> str:
+    return "N/A" if v is None else f"{v:.3f}"
 
-    queries, ground_truths = [], []
-    answers, contexts = [], []
+
+def run_evaluation(
+    samples: Optional[List[Dict[str, str]]] = None,
+    k: Optional[int] = None,
+    threshold: float = 0.7,
+) -> Dict[str, Any]:
+    """
+    跑一次轻量评估，返回 3 个指标 + 单条样本详情。
+
+    samples 不传时从 data/golden_set.json 加载。
+    """
+    samples = samples or load_golden_set()
+    if not samples:
+        return {"error": "黄金集为空，请先创建 data/golden_set.json"}
+
+    k = k or settings.retrieval_top_k
+    hits: List[int] = []
+    faiths: List[float] = []
+    rels: List[float] = []
+    per_sample: List[Dict[str, Any]] = []
 
     for s in samples:
-        queries.append(s.query)
-        ground_truths.append([s.ground_truth])  # RAGAS 期望 list
+        query = s["query"]
         try:
-            result = run_query(s.query, thread_id=f"eval-{hash(s.query) & 0xffff}")
-            answers.append(result.get("final_answer") or result.get("draft_answer", ""))
-            # 用原始检索 chunk 作为评估上下文（方法论上更准确）
-            contexts.append(_retrieve_raw_contexts(s.query) or [""])
+            # max_iterations=1：关闭 critique 循环，评估关心检索+生成质量，
+            # 不重复修改全局 settings（参数化传入）。
+            result = run_query(query, thread_id=f"eval-{uuid.uuid4().hex[:8]}", max_iterations=1)
+            answer = result.get("final_answer") or result.get("draft_answer", "")
+            ctxs = _retrieve_top_k(s, k)
+            hit = 1.0 if _max_cosine(s["ground_truth"], ctxs) >= threshold else 0.0
+            judge = _judge(query, answer, ctxs)
         except Exception as e:
-            logger.warning("样本评估失败 (%s): %s", s.query[:30], e)
-            answers.append("")
-            contexts.append([""])
+            logger.warning("样本评估失败 (%s): %s", query[:30], e)
+            answer, hit, ctxs, judge = "", 0.0, [], {}
 
-    return Dataset.from_dict({
-        "question": queries,
-        "ground_truths": ground_truths,
-        "answer": answers,
-        "contexts": contexts,
-    })
-
-
-def run_ragas_evaluation(samples: List[EvalSample] = None) -> Dict[str, Any]:
-    """
-    跑一次 RAGAS 评估，返回 4 个核心指标 + 单条样本详情。
-    samples 不传时自动生成 settings.eval_dataset_size 条。
-    """
-    try:
-        from ragas import evaluate
-        from ragas.metrics import (
-            answer_relevancy,
-            context_precision,
-            context_recall,
-            faithfulness,
-        )
-    except ImportError as e:
-        return {"error": f"RAGAS 未安装: {e}"}
-
-    # 1. 生成评测集
-    if samples is None:
-        samples = generate_eval_dataset()
-        if not samples:
-            return {"error": "评测集生成失败，请先导入文档"}
-
-    logger.info("开始 RAGAS 评估，样本数：%d", len(samples))
-
-    # 2. 跑 run_query 获取 (answer, context)
-    dataset = _build_ragas_dataset(samples)
-
-    # 3. RAGAS 评估
-    try:
-        # 用智谱 GLM 作为 RAGAS 的 judge LLM + embeddings
-        from langchain_community.chat_models import ChatZhipuAI as ChatLLM
-        from langchain_community.embeddings import ZhipuAIEmbeddings
-
-        judge_llm = ChatLLM(
-            model=settings.zhipu_model,
-            zhipuai_api_key=settings.zhipuai_api_key,
-            temperature=0,
-        )
-        judge_emb = ZhipuAIEmbeddings(
-            model=settings.zhipu_embedding_model,
-            zhipuai_api_key=settings.zhipuai_api_key,
-        )
-
-        result = evaluate(
-            dataset,
-            metrics=[
-                faithfulness,
-                answer_relevancy,
-                context_precision,
-                context_recall,
-            ],
-            llm=judge_llm,
-            embeddings=judge_emb,
-        )
-    except Exception as e:
-        logger.exception("RAGAS 评估异常: %s", e)
-        return {"error": f"评估失败: {e}"}
-
-    # 4. 整理输出
-    scores = {k: float(v) for k, v in result.items()}
-    per_sample = []
-    for i, s in enumerate(samples):
+        hits.append(hit)
+        if judge.get("faithfulness") is not None:
+            faiths.append(judge["faithfulness"])
+        if judge.get("answer_relevancy") is not None:
+            rels.append(judge["answer_relevancy"])
         per_sample.append({
-            "query": s.query,
-            "ground_truth": s.ground_truth,
-            "answer": dataset[i]["answer"][:200],
+            "query": query,
+            "ground_truth": s.get("ground_truth", ""),
+            "source": s.get("source", ""),
+            "answer": (answer or "")[:200],
+            "recall_hit": hit,
+            "faithfulness": judge.get("faithfulness"),
+            "answer_relevancy": judge.get("answer_relevancy"),
         })
 
-    result = {
-        "metrics": scores,
+    metrics = {
+        "recall_at_k": (sum(hits) / len(hits)) if hits else None,
+        "faithfulness": (sum(faiths) / len(faiths)) if faiths else None,
+        "answer_relevancy": (sum(rels) / len(rels)) if rels else None,
+    }
+    result: Dict[str, Any] = {
+        "metrics": metrics,
         "sample_count": len(samples),
         "samples": per_sample,
         "summary": (
-            f"Faithfulness={scores.get('faithfulness', 0):.3f} | "
-            f"AnswerRelevancy={scores.get('answer_relevancy', 0):.3f} | "
-            f"ContextPrecision={scores.get('context_precision', 0):.3f} | "
-            f"ContextRecall={scores.get('context_recall', 0):.3f}"
+            f"Recall@{k}={_fmt(metrics['recall_at_k'])} | "
+            f"Faithfulness={_fmt(metrics['faithfulness'])} | "
+            f"AnswerRelevancy={_fmt(metrics['answer_relevancy'])}"
         ),
     }
 
-    # 4. 自动存档评估报告（data/eval_reports/eval_<时间戳>.json）
+    # 存档报告（metrics 全部为 None 而非 NaN，JSON 合法，前端可 JSON.parse）
     try:
         report_dir = Path(settings.eval_report_dir)
         report_dir.mkdir(parents=True, exist_ok=True)
@@ -260,7 +264,5 @@ def run_ragas_evaluation(samples: List[EvalSample] = None) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    # 命令行直接跑评估
-    import json
-    result = run_ragas_evaluation()
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    logging.basicConfig(level=logging.INFO)
+    print(json.dumps(run_evaluation(), ensure_ascii=False, indent=2))

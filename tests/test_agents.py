@@ -3,6 +3,7 @@ OmniRAG — 测试套件
 测试核心组件，无需实时 API 调用（在需要时使用 mock）。
 """
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -278,23 +279,41 @@ class TestRAGAgentFormatting:
         assert "Score: N/A" in prompt_text
 
 
-# ── 知识图谱关键词提取 ─────────────────────────────────────────────────────────
+# ── 黄金集加载（评估模块）────────────────────────────────────────────────────────
 
-class TestKGKeywords:
-    def test_chinese_keyword_extraction(self):
-        """中文查询应被 jieba 切词，而不是把整句当成一个关键词。"""
-        from app.rag.kg import _extract_keywords
+class TestGoldenSet:
+    def test_load_list_format(self, tmp_path):
+        from app.rag.evaluation import load_golden_set
 
-        keywords = _extract_keywords("华为在2024年发布了什么新产品")
-        assert "华为" in keywords
-        assert "2024" in keywords
-        assert len(keywords) >= 3
+        p = tmp_path / "golden.json"
+        p.write_text(json.dumps([
+            {"query": "q1", "ground_truth": "a1", "source": "s1"},
+            {"query": "q2", "ground_truth": "a2"},
+            {"query": "q3"},  # 缺 ground_truth 应被过滤
+        ]), encoding="utf-8")
 
-    def test_english_keyword_extraction(self):
-        from app.rag.kg import _extract_keywords
+        samples = load_golden_set(str(p))
+        assert len(samples) == 2
+        assert samples[0] == {"query": "q1", "ground_truth": "a1", "source": "s1"}
+        assert samples[1]["source"] == ""
 
-        keywords = _extract_keywords("latest AI progress report")
-        assert "latest" in keywords
+    def test_load_dict_format_with_comment(self, tmp_path):
+        from app.rag.evaluation import load_golden_set
+
+        p = tmp_path / "golden.json"
+        p.write_text(json.dumps({
+            "_comment": "模板说明字段，应被忽略",
+            "samples": [{"query": "q", "ground_truth": "a"}],
+        }), encoding="utf-8")
+
+        samples = load_golden_set(str(p))
+        assert len(samples) == 1
+        assert samples[0]["query"] == "q"
+
+    def test_load_missing_file(self):
+        from app.rag.evaluation import load_golden_set
+
+        assert load_golden_set("/nonexistent/golden.json") == []
 
 
 # ── 多查询检索路径 ─────────────────────────────────────────────────────────────
@@ -332,3 +351,47 @@ class TestMCPHybridSearch:
 
         retriever.invoke.assert_called_once_with("q")
         assert "测试内容" in result[0].text
+
+
+# ── critique_node max_iterations 参数化 ───────────────────────────────────────
+
+class TestCritiqueMaxIterations:
+    @pytest.mark.asyncio
+    async def test_max_iterations_forces_final(self):
+        """max_iterations=1 时，即使评审未通过也应输出 final_answer，且不改全局 settings。"""
+        from langchain_core.messages import HumanMessage
+
+        from app.graph.workflow import AgentState, critique_node
+
+        state = AgentState(
+            messages=[HumanMessage(content="q")], query="q",
+            rag_context="ctx", web_context="", draft_answer="draft",
+            final_answer="", critique="", iterations=0, route="rag_agent",
+        )
+        agent = MagicMock()
+        agent.evaluate.return_value = "REVISE: 不完整"
+        with patch("app.graph.workflow.create_critique_agent", return_value=agent):
+            result = await critique_node(state, max_iterations=1)
+
+        assert result["final_answer"] == "draft"
+        assert result["iterations"] == 1
+
+    @pytest.mark.asyncio
+    async def test_default_uses_settings_limit(self):
+        """不传 max_iterations 时，达到 settings.max_iterations 也应输出 final_answer。"""
+        from langchain_core.messages import HumanMessage
+
+        from app.graph.workflow import AgentState, critique_node, settings
+
+        state = AgentState(
+            messages=[HumanMessage(content="q")], query="q",
+            rag_context="ctx", web_context="", draft_answer="draft",
+            final_answer="", critique="", iterations=settings.max_iterations,
+            route="rag_agent",
+        )
+        agent = MagicMock()
+        agent.evaluate.return_value = "REVISE: 不完整"
+        with patch("app.graph.workflow.create_critique_agent", return_value=agent):
+            result = await critique_node(state)
+
+        assert result["final_answer"] == "draft"
