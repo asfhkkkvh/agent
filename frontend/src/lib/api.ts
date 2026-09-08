@@ -107,6 +107,10 @@ export function ingestFile(file: File) {
   })
 }
 
+export function deleteConversation(threadId: string): Promise<{ message: string }> {
+  return jsonFetch(`/api/conversation/${threadId}`, { method: "DELETE" })
+}
+
 export function runEval(k?: number, threshold?: number): Promise<EvalResult> {
   // 评估耗时长（每样本多次 LLM 调用），给 10 分钟超时避免浏览器/Vite 代理提前切断
   return jsonFetch(

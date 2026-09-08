@@ -38,9 +38,17 @@ function Shell() {
       <BackgroundFX />
       <Sidebar page={page} onNavigate={setPage} config={config} apiOk={apiOk} />
       <main className="relative z-10 min-w-0 flex-1 overflow-hidden">
-        {page === "chat" && <ChatPage config={config} />}
-        {page === "data" && <DataPage />}
-        {page === "eval" && <EvalPage />}
+        {/* 用 CSS display 切换而非条件渲染，避免切页面时组件卸载导致
+            SSE 连接断开和对话状态丢失（对话中跳去评估再回来不会中断） */}
+        <div style={{ display: page === "chat" ? "flex" : "none" }} className="h-full flex-col">
+          <ChatPage config={config} />
+        </div>
+        <div style={{ display: page === "data" ? "block" : "none" }} className="h-full">
+          <DataPage />
+        </div>
+        <div style={{ display: page === "eval" ? "block" : "none" }} className="h-full">
+          <EvalPage />
+        </div>
       </main>
     </div>
   )
