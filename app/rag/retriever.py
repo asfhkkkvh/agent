@@ -9,7 +9,6 @@ import hashlib
 import logging
 from typing import Any, Dict, List, Optional
 
-from langchain_community.chat_models import ChatZhipuAI
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
@@ -17,6 +16,7 @@ from langchain_core.retrievers import BaseRetriever
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import settings
+from app.llm import get_llm
 from app.rag.ingestion import get_vector_store
 from app.rag.reranker import CrossEncoderReranker
 
@@ -36,16 +36,20 @@ class RAGFilters(BaseModel):
 
 FILTER_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """你是一个过滤器提取助手。
-给定用户查询，如果其中明确包含结构化元数据过滤器，请提取出来。
-返回符合 RAGFilters 模式的 JSON。
-如果没有明显的过滤器，则全部返回 null。
+给定用户查询，仅当其中【明确包含结构化元数据过滤器】时才提取，否则全部返回 null。
+
+判定标准（同时满足才提取）：
+- 出现了 "source: <名称>"、"来自 <文档名>"、"<文件名>" 这种明确的文档定位意图；
+- 或 "第 N 页"（page）；
+- 或 "表格/图片"（content_type）这类显式限定词。
+普通的问题、问句、泛指名词一律不构成过滤器，全部返回 null。
 
 模式字段：
 - source：文档名称/标识符（精确匹配）
 - content_type：仅可选 'text'、'table' 或 'image'
 - page：整数页码
 
-务必保守——仅当用户明确提及时才设置过滤器。"""),
+务必极度保守——99% 的查询都不该有过滤器，只有用户明确指定文件/页码时才设置。"""),
     ("human", "查询: {query}"),
 ])
 
@@ -63,7 +67,7 @@ class HybridRetriever(BaseRetriever):
     top_k: int = Field(default_factory=lambda: settings.retrieval_top_k)
     reranker_top_n: int = Field(default_factory=lambda: settings.reranker_top_n)
     use_reranking: bool = True
-    use_filter_extraction: bool = True
+    use_filter_extraction: bool = Field(default_factory=lambda: settings.use_filter_extraction)
     use_multi_query: bool = Field(default_factory=lambda: settings.use_multi_query)
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -99,7 +103,15 @@ class HybridRetriever(BaseRetriever):
         if filters:
             search_kwargs["filter"] = self._build_qdrant_filter(filters)
 
-        candidates = vs.similarity_search(query, **search_kwargs)
+        try:
+            candidates = vs.similarity_search(query, **search_kwargs)
+        except Exception as e:
+            # 混合检索（prefetch dense+sparse）在南美云/代理下偶发失败，
+            # 降级为纯 dense 检索保证查询仍可用（稳定性兜底）。
+            logger.warning("混合检索失败 (%s)，降级为纯 dense 检索。", e)
+            from app.rag.ingestion import get_dense_vector_store
+
+            candidates = get_dense_vector_store().similarity_search(query, **search_kwargs)
         logger.info("通过混合检索检索到 %d 个候选结果。", len(candidates))
 
         if not candidates:
@@ -116,11 +128,7 @@ class HybridRetriever(BaseRetriever):
     def _extract_filters(self, query: str) -> Dict[str, Any]:
         """使用 LLM 从查询中提取元数据过滤器。"""
         try:
-            llm = ChatZhipuAI(
-                model=settings.zhipu_model,
-                zhipuai_api_key=settings.zhipuai_api_key,
-                temperature=0,
-            )
+            llm = get_llm(temperature=0)
             structured_llm = llm.with_structured_output(RAGFilters)
             chain = FILTER_PROMPT | structured_llm
             result: RAGFilters = chain.invoke({"query": query})
@@ -176,11 +184,8 @@ class MultiQueryRetriever:
             仅返回查询语句，每行一个，不要编号。"""),
             ("human", "{query}"),
         ])
-        llm = ChatZhipuAI(
-            model=settings.zhipu_model,
-            zhipuai_api_key=settings.zhipuai_api_key,
-            temperature=0.3,
-        )
+        # 多查询扩展需要一点随机性来生成不同变体，temperature=0.3
+        llm = get_llm(temperature=0.3)
         response = (prompt | llm).invoke({"query": query})
         queries = [q.strip() for q in response.content.strip().split("\n") if q.strip()]
         return [query] + [q for q in queries if q != query][: self.num_queries - 1]

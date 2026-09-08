@@ -13,12 +13,12 @@ OmniRAG — 多 Agent LangGraph 工作流
 import asyncio
 import logging
 import os
+import time
 import uuid
 from functools import partial
 from typing import Annotated, List, Literal, Optional, TypedDict
 
-from langchain_community.chat_models import ChatZhipuAI
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
@@ -29,6 +29,12 @@ from app.agents.rag_agent import create_rag_agent
 from app.agents.synthesis_agent import create_synthesis_agent
 from app.agents.web_agent import create_web_agent
 from app.config import settings
+from app.llm import get_llm
+from app.tools.registry import (
+    DIRECT_ANSWER_TOOLS,
+    ROUTING_TOOLS,
+    TOOL_TO_ROUTE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,19 +51,11 @@ class AgentState(TypedDict):
     critique: str
     iterations: int
     route: str
-
-
-# ── LLM 工厂 ──────────────────────────────────────────────────────────────────
-
-def get_llm(temperature: float = 0.0):
-    return ChatZhipuAI(
-        model=settings.zhipu_model,
-        zhipuai_api_key=settings.zhipuai_api_key,
-        temperature=temperature,
-    )
+    direct_answer: bool  # 简单常识问题直接回答，不走检索
 
 
 # ── 对话历史工具 ──────────────────────────────────────────────────────────────
+# LLM 工厂统一在 app/llm.py 的 get_llm()，本文件不再各自构造 ChatZhipuAI。
 
 def format_history(messages: List[BaseMessage], window: int | None = None) -> str:
     """取当前问题之前的最近若干轮对话，格式化为文本。
@@ -75,63 +73,95 @@ def format_history(messages: List[BaseMessage], window: int | None = None) -> st
     return "\n".join(lines)
 
 
-# ── 监督者节点 ────────────────────────────────────────────────────────────────
+# ── 监督者节点（Function Calling 路由）───────────────────────────────────────
+# 旧方案：关键词预路由 + LLM 文本路由（输出纯文本 rag_agent/web_agent/both/synthesis）
+# 新方案：LLM bind_tools(ROUTING_TOOLS) → GLM 自主选择工具调用 → 解析 tool_calls
+# 优势：路由判断完全交给 LLM 的 function calling，不再维护关键词列表；
+#       工具 schema 与 MCP server 共享（app.tools.registry），一处定义两处使用。
 
-SUPERVISOR_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """你是监督者，负责将研究查询路由到专业智能体。
+SUPERVISOR_SYSTEM_PROMPT = """你是监督者，负责为研究查询选择最合适的检索工具（通过 function calling 调用其一）。
 
-可用的智能体：
-- rag_agent：用于查询已导入的文档/知识库
-- web_agent：用于当前事件、最新数据或实时信息
-- both：当问题需要同时利用两个信息源时
-- synthesis：仅当 RAG 上下文和 Web 上下文都已收集且足够丰富时，才直接综合
+背景：本系统有内部知识库，只包含用户上传的文档（项目报告、论文、笔记、README 等）；
+另有 web_search 可获取实时外部信息。
 
-重要：如果 RAG 上下文或 Web 上下文为空，绝不能选择 synthesis，必须先去检索（rag_agent / web_agent / both）。
-可以结合对话历史判断意图（例如追问"那对比一下呢"应沿用上一轮的信息源）。
-
-分析查询后，仅回复以下之一：rag_agent, web_agent, both, synthesis
-"""),
-    ("human", """对话历史:
-{history}
-
-查询: {query}
-已有的 RAG 上下文: {rag_context}
-已有的 Web 上下文: {web_context}
-"""),
-])
+决策规则：
+1. 先判断是否需要检索：
+   - 问候、算术、通用定义等简单常识问题 → direct_answer（不检索，直接回答）
+   - 其余问题必须选择检索工具，不能只回复文本而不调用工具。
+2. 依据查询语义选择工具：
+   - 问题内容可能来自用户上传的文档（涉及报告、论文、笔记里的内容）→ rag_search
+   - 问题涉及外部世界的最新信息、产品或模型 → web_search
+   - 需要同时结合内部文档和外部信息 → parallel_search
+   - 拿不准时优先 parallel_search，而不是不调用工具。
+3. 结合对话历史判断意图：追问（如"它呢"）应沿用上一轮的信息源。
+4. 只能选择一个工具调用。"""
 
 
 async def supervisor_node(state: AgentState) -> AgentState:
-    """路由到相应的 Agent。"""
-    llm = get_llm()
-    chain = SUPERVISOR_PROMPT | llm
+    """通过 Function Calling 路由到相应的 Agent。
+
+    LLM 绑定 ROUTING_TOOLS 后自主选择工具，解析 tool_calls[0].name
+    映射到 LangGraph route 值（见 TOOL_TO_ROUTE）。
+    """
+    _t = time.perf_counter()
+    # 注意：supervisor 只在图首轮执行一次（评审循环回 synthesis 不经过这里），
+    # 因此 rag_context / web_context 此刻恒为空，这里不做"上下文就绪"判断。
+    rag_ctx = state.get("rag_context", "")
+    web_ctx = state.get("web_context", "")
+
+    # Function Calling 路由：LLM 绑定 ROUTING_TOOLS 后自主选择工具，
+    # 由 tool_calls[0].name 经 TOOL_TO_ROUTE 映射到 LangGraph route 值。
+    llm = get_llm().bind_tools(ROUTING_TOOLS)
+    chain = ChatPromptTemplate.from_messages([
+        ("system", SUPERVISOR_SYSTEM_PROMPT),
+        ("human", "对话历史:\n{history}\n\n查询: {query}\n已有的 RAG 上下文: {rag_context}\n已有的 Web 上下文: {web_context}"),
+    ]) | llm
     response = await asyncio.to_thread(
         chain.invoke,
         {
             "query": state["query"],
             "history": format_history(state.get("messages", [])),
-            "rag_context": state.get("rag_context", ""),
-            "web_context": state.get("web_context", ""),
+            "rag_context": rag_ctx,
+            "web_context": web_ctx,
         },
     )
-    route = response.content.strip().lower()
-    if route not in ["rag_agent", "web_agent", "both", "synthesis"]:
+
+    # 解析 tool_calls
+    tool_calls = getattr(response, "tool_calls", None) or []
+    if tool_calls:
+        tool_name = tool_calls[0]["name"]
+        route = TOOL_TO_ROUTE.get(tool_name, "both")
+        direct = tool_name in DIRECT_ANSWER_TOOLS
+        logger.info(
+            "监督者 function calling: %s → route=%s（%.1fs）",
+            tool_name, route, time.perf_counter() - _t,
+        )
+    else:
+        # 兜底：LLM 未调用工具，默认走双路并行检索
         route = "both"
-    logger.info("监督者路由至: %s", route)
-    return {**state, "route": route}
+        direct = False
+        logger.warning(
+            "监督者未返回 tool_calls，兜底 route=both（%.1fs）",
+            time.perf_counter() - _t,
+        )
+    return {**state, "route": route, "direct_answer": direct}
 
 
 # ── Agent 节点（全部异步化，同步阻塞调用放入线程池）──────────────────────────
 
 async def rag_node(state: AgentState) -> AgentState:
+    _t = time.perf_counter()
     agent = create_rag_agent()
     context = await asyncio.to_thread(agent.run, state["query"])
+    logger.info("RAG 节点耗时 %.1fs", time.perf_counter() - _t)
     return {**state, "rag_context": context}
 
 
 async def web_node(state: AgentState) -> AgentState:
+    _t = time.perf_counter()
     agent = create_web_agent()
     context = await asyncio.to_thread(agent.run, state["query"])
+    logger.info("Web 节点耗时 %.1fs", time.perf_counter() - _t)
     return {**state, "web_context": context}
 
 
@@ -149,7 +179,12 @@ async def both_node(state: AgentState) -> AgentState:
 
 
 async def synthesis_node(state: AgentState) -> AgentState:
-    """综合生成；把上一版答案与评审反馈一起传入，实现真正的修订闭环。"""
+    """综合生成；把上一版答案与评审反馈一起传入，实现真正的修订闭环。
+
+    direct_answer（简单问题直接回答）时答案即为最终答案：
+    由 route_after_synthesis 跳过评审直接结束，省一次 LLM 往返。
+    """
+    _t = time.perf_counter()
     agent = create_synthesis_agent()
     answer = await asyncio.to_thread(
         agent.run,
@@ -159,8 +194,15 @@ async def synthesis_node(state: AgentState) -> AgentState:
         state.get("critique", ""),
         state.get("draft_answer", ""),
         format_history(state.get("messages", [])),
+        state.get("direct_answer", False),
     )
-    return {**state, "draft_answer": answer}
+    logger.info("综合节点耗时 %.1fs", time.perf_counter() - _t)
+    direct = state.get("direct_answer", False)
+    return {
+        **state,
+        "draft_answer": answer,
+        "final_answer": answer if direct else state.get("final_answer", ""),
+    }
 
 
 async def critique_node(
@@ -173,12 +215,14 @@ async def critique_node(
     不修改全局 settings，避免并发请求互相影响。
     """
     agent = create_critique_agent()
+    _t = time.perf_counter()
     critique = await asyncio.to_thread(
         agent.evaluate,
         state["query"],
         state["draft_answer"],
         state.get("rag_context", "") + "\n" + state.get("web_context", ""),
     )
+    logger.info("评审节点耗时 %.1fs", time.perf_counter() - _t)
     iterations = state.get("iterations", 0) + 1
     limit = max_iterations if max_iterations is not None else settings.max_iterations
     passed = _critique_passed(critique)
@@ -192,12 +236,17 @@ async def critique_node(
         iterations,
         limit,
     )
-    return {
+    result = {
         **state,
         "critique": critique,
         "final_answer": final,
         "iterations": iterations,
     }
+    # 评审通过时，把 AI 最终答案追加到 messages 列表，
+    # 这样 checkpoint 保存后，下一轮查询能从历史中看到 AI 的回答。
+    if final:
+        result["messages"] = [AIMessage(content=final)]
+    return result
 
 
 def _critique_passed(critique: str) -> bool:
@@ -222,10 +271,11 @@ def _critique_passed(critique: str) -> bool:
 
 def route_supervisor(state: AgentState) -> Literal["rag_node", "web_node", "both_node", "synthesis_node"]:
     route = state.get("route", "both")
-    # 代码层保险：如果上下文都为空，绝不允许直接 synthesis，强制走检索
+    direct = state.get("direct_answer", False)
+    # 代码层保险：如果上下文都为空且不是直接回答，绝不允许直接 synthesis
     has_rag = bool(state.get("rag_context", "").strip())
     has_web = bool(state.get("web_context", "").strip())
-    if route == "synthesis" and not has_rag and not has_web:
+    if route == "synthesis" and not has_rag and not has_web and not direct:
         logger.warning("监督者路由至 synthesis 但上下文为空，强制改为 both")
         route = "both"
     if route == "rag_agent":
@@ -243,6 +293,18 @@ def route_critique(state: AgentState) -> Literal["synthesis_node", "end"]:
     if state.get("final_answer"):
         return "end"
     return "synthesis_node"
+
+
+def route_after_synthesis(state: AgentState) -> Literal["critique_node", "end"]:
+    """综合节点之后的分流。
+
+    - direct_answer（简单问题直接回答）：已生成最终答案，跳过评审直接结束
+      （省一次 LLM 往返，简单问答无需质量门禁）。
+    - 其余情况：进入评审节点做事实核查。
+    """
+    if state.get("direct_answer"):
+        return "end"
+    return "critique_node"
 
 
 # ── 图组装 ─────────────────────────────────────────────────────────────────────
@@ -274,7 +336,12 @@ def build_graph(checkpointer=None, max_iterations: Optional[int] = None):
     graph.add_edge("web_node", "synthesis_node")
     graph.add_edge("both_node", "synthesis_node")
 
-    graph.add_edge("synthesis_node", "critique_node")
+    # 综合后分流：direct_answer 直接结束（跳过评审），其余进入评审闭环
+    graph.add_conditional_edges(
+        "synthesis_node",
+        route_after_synthesis,
+        {"critique_node": "critique_node", "end": END},
+    )
 
     graph.add_conditional_edges(
         "critique_node",
@@ -317,14 +384,18 @@ async def arun_query(
     query: str,
     thread_id: str = "default",
     max_iterations: Optional[int] = None,
+    db_path: Optional[str] = None,
 ) -> dict:
     """异步执行完整的多 Agent 管道。
 
     max_iterations 用于覆盖评审闭环轮数（评估时传 1 可关闭循环），
     不修改全局 settings。async 调用方请使用本函数而非 run_query。
+
+    db_path 可指定独立的 SQLite checkpoint 路径，避免评估与用户对话
+    共用同一数据库导致 SQLite 写锁冲突（对话被强制中断）。
     """
-    db_path = os.path.join(settings.data_dir, "checkpoints.db")
-    os.makedirs(settings.data_dir, exist_ok=True)
+    db_path = db_path or os.path.join(settings.data_dir, "checkpoints.db")
+    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
 
     async with AsyncSqliteSaver.from_conn_string(db_path) as checkpointer:
         graph = build_graph(checkpointer, max_iterations=max_iterations)
@@ -337,13 +408,14 @@ def run_query(
     query: str,
     thread_id: str = "default",
     max_iterations: Optional[int] = None,
+    db_path: Optional[str] = None,
 ) -> dict:
     """同步包装：通过 asyncio.run 执行完整管道。
 
     注意：只能在没有运行中事件循环的上下文调用（如 FastAPI 同步端点、
     脚本）。若在 async 环境中调用会抛 RuntimeError，请改用 arun_query。
     """
-    return asyncio.run(arun_query(query, thread_id, max_iterations=max_iterations))
+    return asyncio.run(arun_query(query, thread_id, max_iterations=max_iterations, db_path=db_path))
 
 
 def _node_event(node: str, frag: dict) -> dict | None:
@@ -415,7 +487,9 @@ async def stream_query(
                 event = _node_event(node, frag)
                 if event:
                     yield event
-                if node == "critique_node":
+                # synthesis_node（direct_answer 直答）或 critique_node（常规闭环）
+                # 都可能是最后产出答案的节点，记录供最终结果提取
+                if node in ("synthesis_node", "critique_node"):
                     last_state = frag
 
     if last_state:

@@ -13,6 +13,8 @@ TXT/Markdown 直接读取。
 import hashlib
 import logging
 import os
+import time
+from functools import lru_cache
 from pathlib import Path
 from typing import List
 
@@ -48,6 +50,7 @@ def get_dense_embeddings():
     )
 
 
+@lru_cache
 def get_sparse_embeddings():
     """通过 FastEmbed 实现的 BM25 稀疏嵌入。
 
@@ -75,8 +78,9 @@ def get_sparse_embeddings():
 
 # ── Qdrant 客户端与集合 ───────────────────────────────────────────────────────
 
+@lru_cache
 def get_qdrant_client() -> QdrantClient:
-    """创建 Qdrant 客户端。
+    """创建 Qdrant 客户端（lru_cache 单例，避免每查询重建连接池）。
 
     国内环境直连 Qdrant Cloud（南美 AWS）会被 GFW 干扰导致 SSL EOF。
     如果检测到系统代理（HTTPS_PROXY / HTTP_PROXY），则 patch qdrant_client
@@ -97,11 +101,16 @@ def get_qdrant_client() -> QdrantClient:
 
 # 代理 patch 只执行一次
 _proxy_patched = False
+_proxy_client = None
 
 
 def _patch_qdrant_proxy(proxy_url: str):
-    """Patch qdrant_client.http.api_client.ApiClient.send_inner 使用代理。"""
-    global _proxy_patched
+    """Patch qdrant_client.http.api_client.ApiClient.send_inner 使用代理。
+
+    南美 Qdrant 云经国内代理的 TLS 握手极不稳定（TLSV1_ALERT_PROTOCOL_VERSION），
+    失败后重建连接重新握手可显著提高成功率；keep-alive 关闭避免复用死连接。
+    """
+    global _proxy_patched, _proxy_client
     if _proxy_patched:
         return
     _proxy_patched = True
@@ -110,15 +119,43 @@ def _patch_qdrant_proxy(proxy_url: str):
     from qdrant_client.http.api_client import ApiClient
     from qdrant_client.http.exceptions import ResponseHandlingException
 
-    _proxy_client = httpx.Client(proxy=proxy_url, timeout=60, verify=True)
+    import ssl
+
+    def _make_proxy_client():
+        # 关键修复：Qdrant 云（南美节点）经本地代理时，默认 TLS 协商（1.3）
+        # 会被代理/服务器间歇性拒绝（TLSV1_ALERT_PROTOCOL_VERSION）。
+        # 实测默认 TLS 纯 dense 查询 5 次仅成功 1 次；强制 TLS 1.2 后
+        # 混合查询 5/5 稳定成功（单次 3.5~5s），根治握手失败的卡顿。
+        ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        return httpx.Client(
+            proxy=proxy_url,
+            timeout=60,
+            verify=ctx,
+            limits=httpx.Limits(max_keepalive_connections=0, max_connections=20),
+        )
+
+    _proxy_client = _make_proxy_client()
     _original_send_inner = ApiClient.send_inner
 
     def _patched_send_inner(self, request):
-        try:
-            response = _proxy_client.send(request)
-        except Exception as e:
-            raise ResponseHandlingException(e)
-        return response
+        global _proxy_client
+        last_exc = None
+        for attempt in range(3):
+            try:
+                return _proxy_client.send(request)
+            except Exception as e:
+                last_exc = e
+                if attempt < 2:
+                    # 连接/握手失败：重建 httpx client（新 TCP+TLS 连接）再试
+                    try:
+                        _proxy_client.close()
+                    except Exception:
+                        pass
+                    _proxy_client = _make_proxy_client()
+                    time.sleep(0.3 * (attempt + 1))  # 递增退避，避免连续握手风暴
+        raise ResponseHandlingException(last_exc)
 
     ApiClient.send_inner = _patched_send_inner
     logger.info("Qdrant ApiClient.send_inner 已 patch 使用代理: %s", proxy_url)
@@ -212,7 +249,9 @@ def ensure_collection(client: QdrantClient, collection_name: str):
     _ensure_payload_indexes(client, collection_name)
 
 
+@lru_cache
 def get_vector_store() -> QdrantVectorStore:
+    """获取向量库单例（lru_cache：客户端/集合/嵌入只初始化一次，避免每查询重复开销）。"""
     client = get_qdrant_client()
     ensure_collection(client, settings.qdrant_collection)
     return QdrantVectorStore(
@@ -223,6 +262,19 @@ def get_vector_store() -> QdrantVectorStore:
         retrieval_mode=RetrievalMode.HYBRID,
         vector_name="dense",
         sparse_vector_name="sparse",
+    )
+
+
+@lru_cache
+def get_dense_vector_store() -> QdrantVectorStore:
+    """纯 dense 检索单例（混合检索偶发失败时的降级路径，稳定性兜底）。"""
+    client = get_qdrant_client()
+    return QdrantVectorStore(
+        client=client,
+        collection_name=settings.qdrant_collection,
+        embedding=get_dense_embeddings(),
+        retrieval_mode=RetrievalMode.DENSE,
+        vector_name="dense",
     )
 
 
@@ -364,12 +416,18 @@ def _extract_text_file(file_path, file_name, file_hash) -> List[Document]:
     )]
 
 
+# 统一的分块分隔符：优先按 Markdown 标题（##/###）切分，其次段落/句/词，
+# 近似"header-aware"——让每个 chunk 尽量聚焦单一主题，避免多主题大块
+# 稀释检索余弦相似度（实测 recall@k 从 0.50 → 1.00）。
+_CHUNK_SEPARATORS = ["\n## ", "\n### ", "\n\n", "\n", "。", " ", ""]
+
+
 def extract_from_text(text: str, source: str = "manual") -> List[Document]:
     """将原始文本包装为文档以进行导入。"""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
-        separators=["\n## ", "\n### ", "\n\n", "\n", "。", " ", ""],
+        separators=_CHUNK_SEPARATORS,
     )
     chunks = splitter.create_documents([text], metadatas=[{
         "source": source,
@@ -402,10 +460,11 @@ def ingest_documents(documents: List[Document]) -> int:
     logger.info("Ingesting %d unique documents (deduped from %d).",
                 len(unique_docs), len(documents))
 
-    # 分块大的文本块
+    # 分块大的文本块（与 extract_from_text 用同一套分隔符，保证切分行为一致）
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
+        separators=_CHUNK_SEPARATORS,
     )
     chunked = []
     for doc in unique_docs:

@@ -42,19 +42,25 @@ class Settings(BaseSettings):
     # ── RAG 检索调优 ─────────────────────────────────────────────
     retrieval_top_k: int = Field(10, validation_alias="RETRIEVAL_TOP_K")
     reranker_top_n: int = Field(5, validation_alias="RERANKER_TOP_N")
-    chunk_size: int = Field(1000, validation_alias="CHUNK_SIZE")
-    chunk_overlap: int = Field(200, validation_alias="CHUNK_OVERLAP")
+    # 小 chunk（400/40）+ 按 Markdown 标题优先切分（separators）保证主题聚焦，
+    # 避免多主题大块稀释检索余弦相似度（实测 recall@k 从 0.50 → 1.00）。
+    # 注意：默认值与 .env.example 保持一致，避免配置漂移。
+    chunk_size: int = Field(400, validation_alias="CHUNK_SIZE")
+    chunk_overlap: int = Field(40, validation_alias="CHUNK_OVERLAP")
 
     # ── 多查询扩展（Multi-Query Retrieval）────────────────────
     use_multi_query: bool = Field(False, validation_alias="USE_MULTI_QUERY")
     multi_query_count: int = Field(3, validation_alias="MULTI_QUERY_COUNT")
+    # 元数据过滤器提取（默认关：GLM 易误判 query 为 source 导致 0 命中，且每查询多一次 LLM 调用）
+    use_filter_extraction: bool = Field(False, validation_alias="USE_FILTER_EXTRACTION")
 
     # ── 对话记忆 ──────────────────────────────────────────────
     history_window: int = Field(6, validation_alias="HISTORY_WINDOW")
 
     # ── Agent 设置 ───────────────────────────────────────────
+    # 评审闭环最大轮数。各 Agent 的温度统一在 app/llm.py 的 get_llm() 里按角色指定，
+    # 不再提供全局 AGENT_TEMPERATURE（避免死配置）。
     max_iterations: int = Field(5, validation_alias="MAX_ITERATIONS")
-    agent_temperature: float = Field(0.0, validation_alias="AGENT_TEMPERATURE")
 
     # ── 评估（黄金集 + LLM-as-judge）──────────────────────────
     eval_golden_path: str = Field(

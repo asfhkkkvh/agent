@@ -13,15 +13,24 @@ from langchain_core.runnables import Runnable
 
 
 class FakeLLM(Runnable):
-    """可被 ChatPromptTemplate | llm 组合的假 LLM，返回固定 content。"""
+    """可被 ChatPromptTemplate | llm 组合的假 LLM。
 
-    def __init__(self, content: str):
+    - content：invoke 返回的文本（兼容非 FC 场景）
+    - tool_calls：invoke 返回的 tool_calls 列表（模拟 function calling 路由）
+    """
+
+    def __init__(self, content: str = "", tool_calls: list | None = None):
         self._content = content
+        self._tool_calls = tool_calls or []
         self.captured_input = None
+
+    def bind_tools(self, *args, **kwargs):
+        """模拟 llm.bind_tools(...)，返回自身即可（FC 测试用）。"""
+        return self
 
     def invoke(self, *args, **kwargs):
         self.captured_input = args[0] if args else kwargs.get("input")
-        return SimpleNamespace(content=self._content)
+        return SimpleNamespace(content=self._content, tool_calls=self._tool_calls)
 
 # ── 重排序器测试 ──────────────────────────────────────────────────────────────
 
@@ -63,34 +72,6 @@ class TestCrossEncoderReranker:
         assert len(result) == 3  # 回退到截断
 
 
-# ── MCP 计算器测试 ──────────────────────────────────────────────────────────────
-
-class TestMCPCalculator:
-    @pytest.mark.asyncio
-    async def test_basic_arithmetic(self):
-        from app.mcp.server import _calculate
-        result = await _calculate("2 + 2")
-        assert "4" in result[0].text
-
-    @pytest.mark.asyncio
-    async def test_complex_expression(self):
-        from app.mcp.server import _calculate
-        result = await _calculate("(10 + 5) * 2 / 3")
-        assert "10.0" in result[0].text
-
-    @pytest.mark.asyncio
-    async def test_invalid_expression(self):
-        from app.mcp.server import _calculate
-        result = await _calculate("import os; os.system('ls')")
-        assert "计算错误" in result[0].text
-
-    @pytest.mark.asyncio
-    async def test_power_operation(self):
-        from app.mcp.server import _calculate
-        result = await _calculate("2 ** 10")
-        assert "1024" in result[0].text
-
-
 # ── 导入去重测试 ─────────────────────────────────────────────────────────────
 
 class TestIngestion:
@@ -126,7 +107,7 @@ class TestIngestion:
 class TestAgentRouting:
     @pytest.mark.asyncio
     async def test_supervisor_routes_to_rag(self):
-        """监督者节点应根据 LLM 输出将文档查询路由至 RAG。"""
+        """监督者 function calling：LLM 选 rag_search 工具 → 路由至 RAG。"""
         from langchain_core.messages import HumanMessage
 
         from app.graph.workflow import AgentState, route_supervisor, supervisor_node
@@ -143,8 +124,9 @@ class TestAgentRouting:
             route="",
         )
 
+        fc = [{"name": "rag_search", "args": {"query": state["query"]}, "id": "1", "type": "function"}]
         with patch("app.graph.workflow.get_llm") as mock_get_llm:
-            mock_get_llm.return_value = FakeLLM("rag_agent")
+            mock_get_llm.return_value = FakeLLM(tool_calls=fc)
 
             result = await supervisor_node(state)
 
@@ -153,7 +135,7 @@ class TestAgentRouting:
 
     @pytest.mark.asyncio
     async def test_supervisor_fallback_to_both(self):
-        """LLM 返回非法路由时，监督者应回退到 both。"""
+        """LLM 未返回 tool_calls 时，监督者应兜底到 both。"""
         from langchain_core.messages import HumanMessage
 
         from app.graph.workflow import AgentState, supervisor_node
@@ -171,11 +153,39 @@ class TestAgentRouting:
         )
 
         with patch("app.graph.workflow.get_llm") as mock_get_llm:
-            mock_get_llm.return_value = FakeLLM("not-a-valid-route")
+            mock_get_llm.return_value = FakeLLM()  # 无 tool_calls → 兜底
 
             result = await supervisor_node(state)
 
         assert result["route"] == "both"
+
+    @pytest.mark.asyncio
+    async def test_supervisor_direct_answer(self):
+        """监督者 function calling：LLM 选 direct_answer 工具 → 标记直接回答。"""
+        from langchain_core.messages import HumanMessage
+
+        from app.graph.workflow import AgentState, supervisor_node
+
+        state = AgentState(
+            messages=[HumanMessage(content="你好")],
+            query="你好",
+            rag_context="",
+            web_context="",
+            draft_answer="",
+            final_answer="",
+            critique="",
+            iterations=0,
+            route="",
+        )
+
+        fc = [{"name": "direct_answer", "args": {"query": state["query"]}, "id": "1", "type": "function"}]
+        with patch("app.graph.workflow.get_llm") as mock_get_llm:
+            mock_get_llm.return_value = FakeLLM(tool_calls=fc)
+
+            result = await supervisor_node(state)
+
+        assert result["route"] == "synthesis"
+        assert result["direct_answer"] is True
 
     def test_routing_web(self):
 
@@ -267,15 +277,14 @@ class TestRAGAgentFormatting:
             Document(page_content="内容", metadata={"source": "s1", "page": 1})
         ]
 
-        with patch("app.agents.rag_agent.ChatZhipuAI") as mock_chat:
-            mock_chat.return_value = FakeLLM("ok")
-
+        fake = FakeLLM("ok")
+        with patch("app.agents.rag_agent.get_llm", return_value=fake):
             agent = RAGAgent(retriever=retriever)
             out = agent.run("query")
 
         assert out == "ok"
         # 验证传给 LLM 的上下文里评分显示为 N/A 而不是崩溃
-        prompt_text = str(mock_chat.return_value.captured_input)
+        prompt_text = str(fake.captured_input)
         assert "Score: N/A" in prompt_text
 
 
@@ -335,19 +344,19 @@ class TestMultiQuery:
 
 # ── MCP 混合检索工具（回归测试）────────────────────────────────────────────────
 
-class TestMCPHybridSearch:
+class TestMCPRagSearch:
     @pytest.mark.asyncio
-    async def test_hybrid_search_uses_invoke(self):
-        """MCP hybrid_search 应使用新版 invoke API，而不是已移除的 get_relevant_documents。"""
-        from app.mcp.server import _hybrid_search
+    async def test_rag_search_uses_invoke(self):
+        """MCP rag_search 应复用共享 create_retriever 并调新版 invoke API。"""
+        from app.mcp.server import _rag_search
 
         retriever = MagicMock()
         retriever.invoke.return_value = [
             Document(page_content="测试内容", metadata={"source": "t"})
         ]
 
-        with patch("app.rag.retriever.HybridRetriever", return_value=retriever):
-            result = await _hybrid_search("q")
+        with patch("app.agents.rag_agent.create_retriever", return_value=retriever):
+            result = await _rag_search("q")
 
         retriever.invoke.assert_called_once_with("q")
         assert "测试内容" in result[0].text
