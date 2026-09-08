@@ -18,7 +18,7 @@
 | 为什么要多智能体 + LangGraph | 专家分工、状态机清晰、可循环可追踪 |
 | 为什么要自我批评循环 | 一次生成质量不稳，评估-修订闭环 |
 | 为什么要知识图谱（已移除，仅作历史参考） | 曾做实体关系多跳推理，2026-09 已移除 |
-| 为什么要 RAGAS 量化评估（已移除，改为轻量评估） | 凭感觉打分不可复现；现为黄金集+recall@k+LLM-as-judge |
+| 为什么要 RAGAS 量化评估 | 凭感觉打分不可复现；现为黄金集 + RAGAS 4 维 LLM-judge |
 | 为什么要 SSE 流式 | 长任务需实时反馈，避免前端假死 |
 | 为什么引入 MCP | 工具标准化、可被任意 MCP 客户端复用 |
 
@@ -104,7 +104,7 @@ flowchart LR
 | 编排 | LangGraph（异步节点） | 状态机 + 循环 + checkpoint |
 | 记忆 | SQLite checkpoint | 零依赖、文件持久化 |
 | 可观测 | LangSmith | 全链路 trace |
-| 评估 | 轻量评估（黄金集 + recall@k + LLM-as-judge） | 无 RAGAS 重依赖，轻量可复现 |
+| 评估 | RAGAS 4 维评估（黄金集 + LLM-judge） | 标准框架，faithfulness/relevancy/precision/recall |
 | Web 搜索 | Tavily | 免费 1000 次/月 |
 | 后端 | FastAPI + SSE | 异步、流式 |
 | 前端 | React 19 + Vite + shadcn/ui | 现代化、组件全 |
@@ -121,8 +121,8 @@ flowchart LR
 | 5 | 流式执行 | SSE 实时推送每一步 | P1 |
 | 6 | 对话记忆 | SQLite checkpoint，6 轮窗口 | P1 |
 | 7 | 知识图谱可视化（已移除） | 原 vis-network 实时渲染 | — |
-| 8 | 量化评估 | 黄金集 + recall@k + LLM-as-judge + 报告存档 | P1 |
-| 9 | MCP 工具层 | 5 个工具暴露给外部客户端 | P2 |
+| 8 | 量化评估 | 黄金集 + RAGAS 4 维 LLM-judge + 报告存档 | P1 |
+| 9 | MCP 工具层 | 4 个工具暴露给外部客户端 | P2 |
 
 ---
 
@@ -904,11 +904,13 @@ erDiagram
 
 ---
 
-## 问题 7：如何做 RAGAS 量化评估？【已移除，改为轻量评估】
+## 问题 7：如何做 RAGAS 量化评估？
 
-> **该方案已在 2026-09 重构中移除**：不再依赖 RAGAS（及 datasets / pyarrow），改为轻量评估——
-> 人工黄金集 `data/golden_set.json` + 检索 `recall@k` + LLM-as-judge（`faithfulness` / `answer_relevancy`），
-> 命令 `python -m app.rag.evaluation`，报告存 `data/eval_reports/eval_<时间戳>.json`。以下 RAGAS 内容仅作历史参考。
+> **当前方案（2026-09-08 换回）**：人工黄金集 `data/golden_set.json` + RAGAS 4 维评估
+> （faithfulness / answer_relevancy / context_precision / context_recall），
+> 命令 `python -m app.rag.evaluation`，报告存 `data/eval_reports/eval_<时间戳>.json`。
+> 历史：2026-09 初曾因旧版 pyarrow 的 `MonthDayNano` pickle bug / NaN 弃用 RAGAS
+> 改为轻量评估（recall@k + LLM-as-judge）；升级 pyarrow ≥17 后 bug 消除，换回 RAGAS。
 
 ### 第一步 WHY：为什么凭感觉打分不行？
 
@@ -1171,7 +1173,7 @@ sequenceDiagram
 | 序号 | 能力 | 说明 | 优先级 |
 |---|---|---|---|
 | 1 | 标准协议 | MCP（Model Context Protocol） | P0 |
-| 2 | 工具暴露 | hybrid_search/web_search 等 | P0 |
+| 2 | 工具暴露 | rag_search/web_search/full_query/evaluate | P0 |
 | 3 | 独立运行 | python -m app.mcp.server | P1 |
 | 4 | 跨平台 | Windows DLL 引导 | P1 |
 
@@ -1192,25 +1194,28 @@ sequenceDiagram
 
 ### 第四步 代码落地
 
-##### ✅ 正确示范：MCP Server 暴露 5 个工具
+##### ✅ 正确示范：MCP Server 暴露 4 个工具
+
+> 工具选择原则：只暴露宿主 LLM 自己做不到的外部能力。
+> summarise/extract_entities/calculate 本质是"提示词包一层"，宿主直接调 LLM 更快，已移除。
+> parallel_search/direct_answer 是 workflow 内部路由工具，不对外暴露。
 
 ```python
-# app/mcp/server.py 核心思路
+# app/mcp/server.py 核心思路（schema 统一在 app/tools/registry.py）
 app = Server("omnirag-mcp")
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-        Tool(name="hybrid_search", description="搜索知识库", inputSchema={...}),
+        Tool(name="rag_search", description="搜索内部知识库（已上传文档）", inputSchema={...}),
         Tool(name="web_search", description="Tavily 实时网络搜索", inputSchema={...}),
-        Tool(name="summarise_docs", description="总结检索上下文", inputSchema={...}),
-        Tool(name="extract_entities", description="命名实体识别", inputSchema={...}),
-        Tool(name="calculate", description="安全表达式求值", inputSchema={...}),
+        Tool(name="full_query", description="跑完整多 Agent 工作流", inputSchema={...}),
+        Tool(name="evaluate", description="黄金集评估", inputSchema={...}),
     ]
 
 @app.call_tool()
 async def call_tool(name, arguments) -> list[TextContent]:
-    if name == "hybrid_search":
+    if name == "rag_search":
         docs = retriever.invoke(arguments["query"])
         return [TextContent(type="text", text=format_docs(docs))]
     # ... 其他工具分发
@@ -1220,11 +1225,10 @@ async def call_tool(name, arguments) -> list[TextContent]:
 
 | 工具 | 作用 | 复用场景 |
 |---|---|---|
-| hybrid_search | 混合检索知识库 | Claude 查私有文档 |
-| web_search | Tavily 实时搜索 | 任意客户端查实时信息 |
-| summarise_docs | 总结上下文 | 长文档压缩 |
-| extract_entities | 实体识别 | 信息抽取 |
-| calculate | 安全表达式求值 | 数值计算（不用 LLM） |
+| rag_search | 混合检索知识库（复用 create_retriever） | 宿主查私有文档 |
+| web_search | Tavily 实时搜索（复用 tavily_search_robust） | 任意客户端查实时信息 |
+| full_query | 完整多 Agent 工作流（监督者→检索→综合→评审） | 需要高质量结构化答案 |
+| evaluate | 黄金集 + RAGAS 4 维评估 | 离线量化评估 |
 
 ### Windows DLL 引导坑（已在项目踩坑）
 
@@ -1254,7 +1258,7 @@ def _bootstrap_windows_dlls():
 | 问题 | 回答要点 |
 |---|---|
 | 为什么引入 MCP？ | 工具标准化，可被任意客户端复用 |
-| 暴露哪些工具？ | hybrid_search/web_search/summarise/extract/calculate |
+| 暴露哪些工具？ | rag_search/web_search/full_query/evaluate（只暴露宿主做不到的） |
 | Windows 坑在哪？ | pywin32 DLL 不在 sys.path，要引导 |
 | 怎么独立运行？ | python -m app.mcp.server |
 
@@ -1272,7 +1276,7 @@ def _bootstrap_windows_dlls():
 | 多 Agent 编排 | LangGraph 状态机 | ❌ Chain：循环弱 | 学一个框架，换循环并行 |
 | 答案质量 | 评审-修订闭环 | ❌ 一次生成：质量靠运气 | 多几轮 LLM，换可信 |
 | 知识图谱（已移除） | ~~Neo4j Aura + 443 HTTP API~~ | 非真正图推理、成本高收益低，2026-09 已移除 | — |
-| 量化评估 | 轻量评估（黄金集+recall@k+LLM-as-judge） | ❌ 肉眼看 trace：主观 | 人工黄金集 + LLM 打分，轻量可回归 |
+| 量化评估 | RAGAS 4 维评估（黄金集+LLM-judge） | ❌ 肉眼看 trace：主观 | 标准框架，faithfulness/relevancy/precision/recall |
 | 实时反馈 | SSE 流式 | ❌ 轮询：浪费；❌ WebSocket：重 | 单向推送，换简单 |
 | 工具复用 | MCP 标准协议 | ❌ 内嵌：不可复用；❌ 自建 REST：不统一 | 学协议，换标准化 |
 | 对话记忆 | SQLite checkpoint | ❌ 内存：重启丢；❌ Redis：要部署 | 文件持久，换零依赖 |
@@ -1404,13 +1408,15 @@ erDiagram
 
 ## 3.5 MCP 工具层设计
 
+> 原则：只暴露宿主 LLM 自己做不到的外部能力（知识库检索/实时搜索/完整工作流/评估），
+> 纯"提示词包一层"的能力（summarise/extract/calculate）已移除。
+
 | 工具 | 输入 | 输出 | 复用方 |
 |---|---|---|---|
-| hybrid_search | query | 文本+来源 | Claude Desktop |
-| web_search | query | Tavily 结果 | 任意 MCP 客户端 |
-| summarise_docs | docs | 摘要 | 长文档压缩 |
-| extract_entities | text | 实体列表 | 信息抽取 |
-| calculate | 表达式 | 数值 | 数值计算（不走 LLM） |
+| rag_search | query, top_k | 检索文档+来源 | 宿主查私有知识库 |
+| web_search | query, max_results | Tavily 结果 | 任意 MCP 客户端 |
+| full_query | query, thread_id | 完整工作流答案 | 需要高质量结构化答案 |
+| evaluate | k, threshold | 评估指标+报告 | 离线量化评估 |
 
 ---
 
@@ -1506,7 +1512,7 @@ stateDiagram-v2
 | LLM 结构化输出 None | kg 抽取（已移除） | 原重试 + fallback | ✅ |
 | Neo4j Bolt RST（已移除） | kg 模块 | 原改走 443 HTTP API | ✅ |
 | bge 模型下载超时 | reranker | HF_ENDPOINT=hf-mirror | ✅ |
-| RAGAS 评测卡死（已移除） | evaluation | 原单线程执行；现轻量评估无此依赖 | ✅ |
+| RAGAS 评测卡死 | evaluation | 单线程执行（RunConfig.max_workers=1），避免线程卡死 | ✅ |
 | 文档解析依赖 403 | ingestion | Docling→PyMuPDF→zipfile 三级兜底 | ✅ |
 | 前端拿缺字段 200 | /api/stats | 返回完整结构+error 字段 | ✅ |
 | Qdrant SSL 偶断 | /api/stats | 返回 error，前端可选链 | ✅ |
@@ -1542,7 +1548,7 @@ stateDiagram-v2
 | 双源并行 | "对比内部和外部" | route=both | SSE 事件 |
 | 文件导入 | POST /api/ingest/file (pdf) | chunks>0 | 上传 |
 | 文本导入 | POST /api/ingest/text | chunks>0 | 上传 |
-| 评估 | POST /api/evaluate | recall@k/faithfulness/answer_relevancy + 报告路径 | 异步等 |
+| 评估 | POST /api/evaluate | RAGAS 4 维指标 + 报告路径 | 异步等 |
 
 ## 5.2 边界场景验证
 

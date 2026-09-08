@@ -18,6 +18,8 @@ import logging
 import os
 import sys
 import tempfile
+import threading
+import time
 import uuid
 from typing import Optional
 
@@ -58,6 +60,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 
 from app.config import settings
 
@@ -67,7 +70,48 @@ from app.rag.evaluation import run_evaluation
 from app.rag.ingestion import extract_from_text, ingest_documents, ingest_file
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+
+# 日志同时输出到终端和 logs/omnirag.log
+_LOG_DIR = os.path.join(_PROJECT_ROOT, "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(os.path.join(_LOG_DIR, "omnirag.log"), encoding="utf-8"),
+    ],
+)
+
+
+# ── 启动预热 ──────────────────────────────────────────────────────────────────
+
+def _warmup_worker():
+    """后台预热：初始化向量库单例（Qdrant 客户端 + 集合校验 + dense/sparse 嵌入器）。
+
+    向量库首次初始化约 25-30s（含 Qdrant 云多次往返），若放到首条查询才触发，
+    用户会明显感到"卡顿"。启动时在后台线程提前完成，首条查询直接复用。
+    同时预检重排序器：未缓存则提前标记失败，避免首条查询额外等待 ~8s 的模型检查。
+    """
+    try:
+        from app.rag.ingestion import get_vector_store
+        t = time.perf_counter()
+        get_vector_store()
+        logger.info("启动预热完成：向量库初始化 %.1fs", time.perf_counter() - t)
+    except Exception as e:
+        logger.warning("启动预热失败（不影响服务，查询时懒加载兜底）: %s", e)
+    try:
+        from app.rag.reranker import CrossEncoderReranker
+        CrossEncoderReranker()._get_model()
+    except Exception:
+        pass
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    threading.Thread(target=_warmup_worker, daemon=True).start()
+    yield
+
 
 # ── 应用实例 ─────────────────────────────────────────────────────────────────
 
@@ -75,6 +119,7 @@ app = FastAPI(
     title="OmniRAG API",
     description="多智能体混合 RAG 研究平台 REST 接口",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # 允许前端跨域调用，方便 React/Vue 本地开发
@@ -84,6 +129,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── 请求耗时记录中间件 ─────────────────────────────────────────────────────
+
+@app.middleware("http")
+async def log_request_duration(request, call_next):
+    """记录每个 HTTP 请求的方法、路径和耗时。"""
+    start = time.perf_counter()
+    method = request.method
+    path = request.url.path
+    response = await call_next(request)
+    duration = time.perf_counter() - start
+    logger.info("API %s %s → %d (%.1fs)", method, path, response.status_code, duration)
+    return response
 
 
 # ── 请求/响应模型 ────────────────────────────────────────────────────────────
@@ -123,10 +182,7 @@ class HealthResponse(BaseModel):
 
 class EvalRequest(BaseModel):
     k: Optional[int] = Field(
-        None, description="检索召回评估的 top-k（默认用 RETRIEVAL_TOP_K）"
-    )
-    threshold: Optional[float] = Field(
-        None, description="recall 判定余弦相似度阈值（默认 0.7）"
+        None, description="检索 top-k（默认用 RETRIEVAL_TOP_K）"
     )
 
 
@@ -318,21 +374,22 @@ def ingest_text_endpoint(req: TextIngestRequest) -> IngestResponse:
         raise HTTPException(status_code=500, detail=f"导入失败: {e}")
 
 
-# ── 轻量评估（黄金集 + LLM-as-judge）──────────────────────────────────────────
+# ── RAGAS 评估（黄金集 + 4 维 LLM-judge）────────────────────────────────────
 
 @app.post("/api/evaluate", response_model=EvalResponse)
 def evaluate_endpoint(req: EvalRequest) -> EvalResponse:
     """
-    跑一次轻量评估（黄金集 + 检索 recall@k + LLM-as-judge）：
+    跑一次 RAGAS 评估：
         1. 从 data/golden_set.json 加载人工校验样本
         2. 对每条样本调 run_query 获取答案 + 检索 top-k 原始 chunk
-        3. 输出 3 个指标：
-           - recall_at_k       检索是否召回了 ground_truth 所在内容
-           - faithfulness      答案是否忠于检索上下文
-           - answer_relevancy  答案是否切题
+        3. 构造成 RAGAS SingleTurnSample，输出 4 个指标：
+           - faithfulness        答案是否忠于检索上下文（无幻觉）
+           - answer_relevancy    答案是否切题
+           - context_precision   检索上下文是否包含相关信息
+           - context_recall      标准答案信息是否被检索到
     """
     try:
-        result = run_evaluation(k=req.k, threshold=req.threshold or 0.7)
+        result = run_evaluation(k=req.k)
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
         return EvalResponse(
@@ -346,6 +403,31 @@ def evaluate_endpoint(req: EvalRequest) -> EvalResponse:
     except Exception as e:
         logger.exception("评估失败")
         raise HTTPException(status_code=500, detail=f"评估失败: {e}")
+
+
+# ── 对话管理 ──────────────────────────────────────────────────────────────────
+
+@app.delete("/api/conversation/{thread_id}")
+def delete_conversation(thread_id: str):
+    """删除指定对话的 SQLite checkpoint 数据。"""
+    import sqlite3
+    db_path = os.path.join(settings.data_dir, "checkpoints.db")
+    if not os.path.exists(db_path):
+        return {"message": "数据库不存在", "deleted": 0}
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # langgraph 的 SQLite saver 表名通常是 checkpoints / writes
+        cursor.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
+        cursor.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        logger.info("删除对话 %s: %d 条 checkpoint 记录", thread_id, deleted)
+        return {"message": "对话已删除", "thread_id": thread_id}
+    except Exception as e:
+        logger.error("删除对话失败: %s", e)
+        raise HTTPException(status_code=500, detail=f"删除失败: {e}")
 
 
 # ── 前端静态资源（frontend/dist，构建后由 FastAPI 同源托管）────────────────

@@ -1,7 +1,7 @@
 ╔══════════════════════════════════════════════════════════════════════════════════╗
 ║         🧠  多智能体混合 — 完整项目指南（献给所有人！）                         ║
 ║         简明易懂 + 每个代码文件 + 每个功能详解                                 ║
-║         GitHub: github.com/avinash1041/multi-agent-hybrid-rag                  ║
+║         GitHub: github.com/asfhkkkvh/agent                                       ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 
 
@@ -27,10 +27,10 @@
       具体发生了什么
 
   🛠️  他们还携带一个特殊的工具箱（称为 MCP），里面有：
-      - 一个计算器
-      - 一个搜索工具
-      - 一个摘要器
-      - 一个实体查找器
+      - 一个知识库搜索工具（rag_search）
+      - 一个实时网络搜索工具（web_search）
+      - 一个完整工作流入口（full_query）
+      - 一个离线评估工具（evaluate）
 
 这就是多智能体混合系统！
 
@@ -660,52 +660,50 @@
 它的作用：
   运行一个独立的 MCP（模型上下文协议）服务器。
   其他 AI 系统（如 Claude Desktop）可以连接到它
-  并使用它的 5 个工具，就像它们是自己的工具一样。
+  并使用它的 4 个工具，就像它们是自己的工具一样。
+  工具 schema 统一在 app/tools/registry.py（与 workflow 的
+  function calling 共享同一份定义），mcp/server.py 只负责分发。
 
 像五岁小孩理解的那样：
   想象一个任何工人都可以借用的工具箱。
-  工人 A（Claude）说"我需要一把锤子"（hybrid_search）。
+  工人 A（Claude）说"我需要一把锤子"（rag_search）。
   工具箱送出锤子。工人使用它。归还它。
   这就是 MCP 实现的 — AI 到 AI 的工具共享！
 
-5 个工具：
+只保留宿主 LLM 自己做不到的外部能力（4 个工具）：
 
-  工具 1: hybrid_search
+  工具 1: rag_search
   ┌────────────────────────────────────────────────────────┐
-  │  搜索 Qdrant 知识库                                   │
+  │  搜索 Qdrant 知识库（复用 rag_agent 的 create_retriever）│
   │  输入: {"query": "...", "top_k": 5}                   │
   │  输出: 前 5 个匹配的文档文本块及得分                  │
   └────────────────────────────────────────────────────────┘
 
   工具 2: web_search
   ┌────────────────────────────────────────────────────────┐
-  │  通过 Tavily 搜索实时互联网                           │
+  │  通过 Tavily 搜索实时互联网（复用 tavily_search_robust）│
   │  输入: {"query": "...", "max_results": 5}             │
   │  输出: 5 个带 URL 的实时网络结果                      │
   └────────────────────────────────────────────────────────┘
 
-  工具 3: summarise_docs
+  工具 3: full_query
   ┌────────────────────────────────────────────────────────┐
-  │  摘要文档文本列表                                     │
-  │  输入: {"documents": [...], "focus": "revenue"}       │
-  │  输出: 简洁段落摘要                                    │
+  │  运行完整多 Agent 工作流（监督者→检索→综合→评审）    │
+  │  输入: {"query": "...", "thread_id": "可选",          │
+  │         "max_iterations": 2}                          │
+  │  输出: 最终答案 + 路由 + 评审（20-60 秒）             │
   └────────────────────────────────────────────────────────┘
 
-  工具 4: extract_entities
+  工具 4: evaluate
   ┌────────────────────────────────────────────────────────┐
-  │  在文本中查找姓名、组织、日期、数字                    │
-  │  输入: {"text": "..."}                                │
-  │  输出: 人物: ... 组织: ... 日期: ...                  │
+  │  对黄金集跑轻量评估（recall@k/faithfulness/relevancy） │
+  │  输入: {"k": 10, "threshold": 0.7}（可选）            │
+  │  输出: 3 个指标 + 报告路径（3-10 分钟）               │
   └────────────────────────────────────────────────────────┘
 
-  工具 5: calculate  （安全 — 不使用 eval()！）
-  ┌────────────────────────────────────────────────────────┐
-  │  使用 Python AST 安全地评估数学表达式                 │
-  │  输入: {"expression": "(10 + 5) * 2 / 3"}            │
-  │  输出: "(10 + 5) * 2 / 3 = 10.0"                      │
-  │  安全性: 使用 ast.parse() 而非 eval()                 │
-  │  拒绝: "import os" 或任何非数学表达式                 │
-  └────────────────────────────────────────────────────────┘
+  ⚠️ 已移除的工具：summarise_docs / extract_entities / calculate
+     它们是"提示词包一层"的能力，宿主直接调 LLM 更快，
+     做成 MCP 工具纯浪费往返。
 
 连接到 Claude Desktop：
   添加到 claude_desktop_config.json：
@@ -718,7 +716,7 @@
       }
     }
   }
-  现在 Claude Desktop 可以使用所有 5 个工具！
+  现在 Claude Desktop 可以使用所有 4 个工具！
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -738,47 +736,29 @@ Tailwind CSS v4 + shadcn/ui。原 app/main.py（Streamlit）
   客户（用户）看到窗户（UI）并下单（问题）。
   厨房（智能体）烹饪食物（答案），窗户展示它。
 
-代码中的关键功能：
+代码中的关键功能（React 19 + Vite + shadcn/ui，与后端 8000 通过 Vite 代理联调）：
 
-  1. 文件上传器（第 126-144 行）
-     ┌────────────────────────────────────────────────┐
-     │  uploaded_files = st.file_uploader(            │
-     │      "上传文件",                               │
-     │      type=["pdf", "docx", "txt", "md"],        │
-     │      accept_multiple_files=True                │
-     │  )                                             │
-     └────────────────────────────────────────────────┘
-     拖放多个文件 → 立即入库到 Qdrant。
+  1. 文件上传器
+     侧边栏拖放 PDF/DOCX/TXT/MD → POST /api/ingest/file（multipart）
+     → 解析分块入库 Qdrant → 实时刷新知识库统计与向量预览。
 
-  2. 聊天界面（第 195-270 行）
-     ┌────────────────────────────────────────────────┐
-     │  if query := st.chat_input("随便问什么..."):  │
-     │      result = run_query(query, thread_id)       │
-     │      st.markdown(result["final_answer"])        │
-     └────────────────────────────────────────────────┘
-     干净的聊天界面。每个对话都有唯一的 thread_id
-     用于记忆连续性。
+  2. 聊天界面（SSE 流式）
+     输入问题 → POST /api/query/stream → 前端逐条渲染
+     SSE 事件（route → rag/web → synthesis → critique → final），
+     流式展示 Agent 执行过程，不阻塞等待。
 
-  3. 智能体路由徽章（自定义 HTML/CSS）
-     显示智能体走了哪条路径：
+  3. 智能体路由徽章
+     展示本次查询走的路径：
      🟢 rag_agent  → 搜索了你的文档
      🔵 web_agent  → 搜索了互联网
      🟣 both       → 搜索了两个来源
 
-  4. LangSmith 追踪链接（第 253 行）
-     ┌────────────────────────────────────────────────┐
-     │  st.caption(f"📡 查看 LangSmith 追踪: {url}") │
-     └────────────────────────────────────────────────┘
-     每个答案都有指向其完整追踪的可点击链接。
+  4. 来源引用与对话记忆
+     答案内联标注 [RAG: 来源/页码] / [Web: URL]；
+     每个会话携带 thread_id，后端 SQLite checkpoint 记住多轮上下文。
 
-  5. 会话状态管理
-     ┌────────────────────────────────────────────────┐
-     │  if "chat_history" not in st.session_state:    │
-     │      st.session_state.chat_history = []        │
-     │  if "thread_id" not in st.session_state:       │
-     │      st.session_state.thread_id = uuid4()      │
-     └────────────────────────────────────────────────┘
-     即使在页面刷新后也能记住完整对话。
+  5. 构建产物由 FastAPI 同源托管
+     npm run build 后，FastAPI 自动托管 frontend/dist，单端口访问。
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -786,7 +766,7 @@ Tailwind CSS v4 + shadcn/ui。原 app/main.py（Streamlit）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 它的作用：
-  12 个自动化测试，验证每个组件正常工作。
+  23 个自动化测试，验证每个组件正常工作。
   运行方式：pytest tests/ -v
 
 像五岁小孩理解的那样：
@@ -794,27 +774,29 @@ Tailwind CSS v4 + shadcn/ui。原 app/main.py（Streamlit）
   "它能打开吗？✅ 它能播放音乐吗？✅ 它安全吗？✅"
   测试对代码做同样的事情！
 
-测试组：
+测试组（对应 2026-09 重构后的现状）：
   TestCrossEncoderReranker（3 个测试）
   - test_rerank_returns_top_n
   - test_rerank_handles_empty_docs
   - test_rerank_handles_model_failure
 
-  TestMCPCalculator（4 个测试）
-  - test_basic_arithmetic:      "2 + 2" → "4"
-  - test_complex_expression:    "(10+5)*2/3" → "10.0"
-  - test_invalid_expression:    "import os" → 错误（安全检查！）
-  - test_power_operation:       "2 ** 10" → "1024"
-
   TestIngestion（2 个测试）
   - test_deduplication:         同一文档两次 → 仅存储一次
   - test_text_extraction:       文本正确分块并带元数据
 
-  TestAgentRouting（5 个测试）
-  - test_routing_web:           route="web_agent" → "web_node"
-  - test_routing_both:          route="both" → "both_node"
-  - test_critique_ends_on_good: final_answer 已设置 → 路由到结束
-  - test_critique_loops_on_revise: 无 final_answer → 循环回来
+  TestAgentRouting（8 个测试）
+  - test_supervisor_routes_to_rag:  function calling → rag_agent
+  - test_supervisor_fallback_to_both: 无 tool_calls → 兜底 both
+  - test_supervisor_direct_answer:  direct_answer 工具 → 直接回答
+  - test_routing_web / test_routing_both: route 值 → 图节点映射
+  - test_critique_*:              评审通过/修订/NOT GOOD/尾部结论判定
+
+  TestRAGAgentFormatting / TestGoldenSet / TestMultiQuery /
+  TestMCPRagSearch / TestCritiqueMaxIterations（其余 10 个测试）
+  - MCP rag_search 复用 create_retriever 回归、黄金集加载、多查询路径、
+    critique max_iterations 参数化等
+
+  ⚠️ 已删除的测试：TestMCPCalculator（calculate 工具已移除）
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -944,16 +926,16 @@ NEO4J_* 配置）。原 kg_retrieve 只是 jieba 关键词 + 1 跳邻居，
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-文件 16: app/rag/evaluation.py — 轻量评估员
+文件 16: app/rag/evaluation.py — RAGAS 评估员
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 它的作用：
-  用轻量评估给 RAG 系统打"量化分数"，共 3 个指标：
-  - recall_at_k（检索召回）：对每条黄金样本取回 top-k chunk，
-    用智谱 embedding 计算 ground_truth 与各 chunk 的最大余弦
-    相似度，超过阈值（默认 0.7）记为命中，命中率即 recall@k
-  - faithfulness（忠实性）：答案是否基于上下文、没编造（LLM 打分 0-1）
-  - answer_relevancy（切题性）：答案是否回应了问题（LLM 打分 0-1）
+  用 RAGAS 框架给 RAG 系统打"量化分数"，共 4 个指标
+  （judge LLM 用智谱 GLM，与生成同模型，用于相对度量迭代效果）：
+  - faithfulness（忠实性）：答案关键论断是否被检索上下文支撑（无幻觉）
+  - answer_relevancy（切题性）：答案是否切题、完整覆盖问题
+  - context_precision（上下文精确率）：检索上下文是否包含回答所需信息
+  - context_recall（上下文召回率）：标准答案信息是否被检索到
 
 评测集：
   人工黄金集 data/golden_set.json：人工校验的 (query, ground_truth, source)，
@@ -967,7 +949,7 @@ NEO4J_* 配置）。原 kg_retrieve 只是 jieba 关键词 + 1 跳邻居，
 
 关键函数：
 
-  1. load_golden_set()  [第 38 行]
+  1. load_golden_set()  [第 55 行]
      ┌────────────────────────────────────────────────┐
      │  rows = data.get("samples", data)              │
      │  samples = [                                   │
@@ -976,32 +958,39 @@ NEO4J_* 配置）。原 kg_retrieve 只是 jieba 关键词 + 1 跳邻居，
      └────────────────────────────────────────────────┘
      加载人工黄金集，兼容顶层数组 / 顶层对象两种格式。
 
-  2. run_evaluation()  [第 184 行]
+  2. run_evaluation()  [第 103 行]
      ┌────────────────────────────────────────────────┐
      │  result = run_query(query, thread_id=...,      │
      │                     max_iterations=1)          │
      │  ctxs = _retrieve_top_k(s, k)                  │
-     │  hit = _max_cosine(ground_truth, ctxs) >= th   │
-     │  judge = _judge(query, answer, ctxs)           │
+     │  sample = SingleTurnSample(                    │
+     │      user_input=query, response=answer,        │
+     │      retrieved_contexts=ctxs, reference=gt)    │
+     │  evaluate(dataset, metrics=[4 个指标],         │
+     │           llm=eval_llm, embeddings=... )       │
      └────────────────────────────────────────────────┘
-     对每条黄金样本跑一次 RAG 流水线拿答案 + 检索 top-k，
-     计算 recall@k，再用智谱 GLM-4 作 judge LLM 打
-     faithfulness / answer_relevancy 分（0-1）。
+     对每条黄金样本跑一次 RAG 流水线拿答案 + 检索原始 chunk，
+     构造成 RAGAS SingleTurnSample，evaluate 输出 4 维指标。
 
   3. __main__ 入口
      python -m app.rag.evaluation 可直接命令行跑评估。
 
 为什么重要：
   Self-Critique 循环是在线质量门禁（决定要不要重写），
-  轻量评估是离线量化评估（给迭代效果打分）。
+  RAGAS 评估是离线量化评估（给迭代效果打分）。
   两者不冲突：一个管"这次答案能不能发出去"，
   一个管"我整体 RAG 系统水平怎么样"。
 
-【已移除，仅作历史参考】旧版曾用 RAGAS 框架做 4 维量化评估
-（faithfulness / answer_relevancy / context_precision / context_recall），
-依赖 ragas / datasets / pyarrow。因存在 pyarrow MonthDayNano pickle bug、
-NaN 结果、judge 与生成同模型自引用失真等问题，2026-09 重构后
-已移除 ragas 依赖，改为上面的轻量评估。旧方案讲解保留作学习素材：
+兼容性说明：
+  - pyarrow 需 ≥17（旧版 MonthDayNano pickle bug 已修复，2026-09 升级后换回 RAGAS）
+  - langchain-community 0.4.x 已移除 ChatVertexAI，evaluation.py 顶部
+    注入 vertexai shim 模块绕过 ragas 顶层 import
+  - 用 ragas.metrics 旧版路径（llm 可选），兼容智谱 LangchainLLMWrapper
+
+【历史记录】2026-09 初曾因旧版 pyarrow 的 MonthDayNano pickle bug、
+NaN 结果弃用 RAGAS，改为自建轻量评估（recall@k + LLM-as-judge）；
+升级 pyarrow ≥17 后 bug 消除，2026-09-08 换回 RAGAS 4 维标准评估。
+旧轻量评估实现已删除，仅保留黄金集加载与检索上下文复用：
 
   旧 generate_eval_dataset(n)  [第 40 行]
      ┌────────────────────────────────────────────────┐
@@ -1184,8 +1173,8 @@ pytest          | 自动化测试               | 代码的质量检查员
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 步骤 1 — 获取代码
-  git clone https://github.com/avinash1041/multi-agent-hybrid-rag.git
-  cd multi-agent-hybrid-rag
+  git clone https://github.com/asfhkkkvh/agent.git
+  cd agent
 
 步骤 2 — 获取 API 密钥（只需 4 个）
   A. 智谱 GLM:       bigmodel.cn → 控制台             → ZHIPUAI_API_KEY
@@ -1256,14 +1245,14 @@ pytest          | 自动化测试               | 代码的质量检查员
  第 10 部分 — 项目统计与摘要
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  文件总数：          32 个文件
+  文件总数：          约 30 个文件
   代码总行数：        约 2,000+ 行
   智能体：             5 个（监督者、RAG、网络、综合、批判）
-  MCP 工具：           5 个（hybrid_search、web_search、summarise、entities、calc）
+  MCP 工具：           4 个（rag_search、web_search、full_query、evaluate）
   测试用例：           23 个自动化测试
   使用的技术：         18+ 种现代 AI/ML 工具
   月度成本：           $0（100% 免费套餐，智谱 GLM-4-Flash 免费层 + Qdrant Cloud 免费层）
-  响应时间：           每次查询约 4-8 秒
+  响应时间：           每次查询约 10-60 秒（含检索/网络/生成，视路由而定）
   支持的文件类型：     PDF、DOCX、TXT、Markdown
   部署选项：           Render、Railway、HuggingFace、Docker
   接口入口：           React UI + FastAPI REST（含 SSE 流式查询与 evaluate）
@@ -1279,6 +1268,6 @@ pytest          | 自动化测试               | 代码的质量检查员
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- 为以下人员创建：Avinash | github.com/avinash1041/multi-agent-hybrid-rag
- 本指南：理解每个文件和概念的完整伴侣。
+ 项目：OmniRAG | github.com/asfhkkkvh/agent
+  本指南：理解每个文件和概念的完整伴侣。
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

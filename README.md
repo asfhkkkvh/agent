@@ -1,6 +1,6 @@
 # OmniRAG — 多智能体混合研究平台
 
-基于 LangGraph 的多 Agent RAG 系统：监督者路由 → 混合检索（dense + BM25 稀疏 + cross-encoder 重排）→ 综合 → 自评审闭环。自带 FastAPI REST/SSE 接口、React 19 前端、MCP Server 与轻量量化评估（黄金集 + 检索 recall@k + LLM-as-judge）。
+基于 LangGraph 的多 Agent RAG 系统：监督者路由 → 混合检索（dense + BM25 稀疏 + cross-encoder 重排）→ 综合 → 自评审闭环。自带 FastAPI REST/SSE 接口、React 19 前端、MCP Server 与 RAGAS 4 维量化评估。
 
 ## 架构
 
@@ -41,7 +41,7 @@ Sparse(FastEmbed BM25)   ┘             (bge-reranker-base)
 - **自评审闭环**：评审 Agent 的 REVISE 反馈传回综合 Agent 迭代修订，默认最多 5 轮，可通过 `MAX_ITERATIONS` 调整
 - **对话记忆**：LangGraph SQLite checkpoint，同一 `thread_id` 延续上下文
 - **接口完整**：FastAPI REST + SSE 流式事件（路由/检索/综合/评审逐步可见）、文件/文本导入、知识库统计、MCP Server
-- **轻量评估**：人工黄金集 + 检索 recall@k + LLM-as-judge（faithfulness / answer_relevancy），不依赖 ragas/datasets/pyarrow
+- **RAGAS 评估**：人工黄金集 + RAGAS 4 维 LLM-judge（faithfulness / answer_relevancy / context_precision / context_recall）
 - **LangSmith 可观测**：全链路追踪
 - **国内网络适配**：自动读取系统代理、Qdrant 走代理 patch、HF 镜像、多级文档解析降级
 
@@ -98,27 +98,29 @@ npm run build
 | POST | `/api/query/stream` | 流式查询（SSE，逐步推送 Agent 状态） |
 | POST | `/api/ingest/file` | 上传文件导入 |
 | POST | `/api/ingest/text` | 文本导入 |
-| POST | `/api/evaluate` | 轻量评估（黄金集 + recall@k + LLM-judge） |
+| POST | `/api/evaluate` | RAGAS 评估（黄金集 + 4 维 LLM-judge） |
 
 ## 评估
 
-评估基于**人工校验的黄金集**（`data/golden_set.json`），而非系统自产自销，避免自引用失真。每个样本计算：
+评估基于**人工校验的黄金集**（`data/golden_set.json`），用 **RAGAS** 框架计算 4 个指标（judge LLM 用智谱 GLM）：
 
-- **recall@k**：检索 top-k 是否召回了 ground truth 相关内容（dense 余弦相似度 ≥ 阈值）
-- **faithfulness**：答案是否忠于检索上下文（LLM 打分 0-1）
-- **answer_relevancy**：答案是否切题（LLM 打分 0-1）
+- **faithfulness**：答案关键论断是否被检索上下文支撑（无幻觉）
+- **answer_relevancy**：答案是否切题、完整覆盖问题
+- **context_precision**：检索上下文是否包含回答问题所需的信息
+- **context_recall**：标准答案中的信息是否被检索到
 
 ```bash
 # CLI 跑评估（需先导入文档并填写黄金集）
 python -m app.rag.evaluation
 
 # 或通过 API
-curl -X POST http://localhost:8000/api/evaluate -H 'Content-Type: application/json' -d '{"k": 10, "threshold": 0.7}'
+curl -X POST http://localhost:8000/api/evaluate -H 'Content-Type: application/json' -d '{"k": 10}'
 ```
 
 报告自动存档到 `data/eval_reports/eval_<时间戳>.json`，前端「质量评估」页可视化。
 
-> 黄金集模板：`data/golden_set.json` 内置 3 条示例，请按你实际导入的知识库内容替换与扩充。`query` 必须能从库中检索到答案。
+> 黄金集模板：`data/golden_set.json` 内置 12 条样本，请按你实际导入的知识库内容替换与扩充。`query` 必须能从库中检索到答案。
+> 依赖说明：pyarrow 需 ≥17（旧版 `MonthDayNano` pickle bug 已修复）；judge 与生成同模型，指标用于相对度量迭代效果。
 
 ## 项目结构
 
@@ -133,8 +135,8 @@ app/
 │   ├── retriever.py     # 混合检索（dense+sparse RRF + 重排）
 │   ├── ingestion.py     # 文档解析→分块→向量化→入库
 │   ├── reranker.py      # bge-reranker-base 重排
-│   └── evaluation.py    # 黄金集 + recall@k + LLM-as-judge
-└── mcp/server.py        # MCP Server（hybrid_search / web_search / …）
+│   └── evaluation.py    # 黄金集 + RAGAS 4 维评估（faithfulness/relevancy/precision/recall）
+└── mcp/server.py        # MCP Server（rag_search / web_search / full_query / evaluate）
 frontend/                # React 19 + Vite + Tailwind + shadcn/ui
 scripts/ingest.py        # CLI 导入工具
 tests/                   # pytest 单元测试（路由/评审/检索格式化/黄金集…）
@@ -145,7 +147,7 @@ Dockerfile               # 多阶段构建（前端 + 后端）
 ## 重构说明（2026-09）
 
 - **移除知识图谱（Neo4j）**：原 `kg_retrieve` 为 jieba 关键词 + 一跳邻居，非真正的图推理，且每个 chunk 一次 LLM 实体抽取成本高、收益低。移除后依赖（neo4j/jieba）与安全隐患（`aura_query` 的 `verify=False`）一并消除。
-- **RAGAS → 轻量评估**：RAGAS 依赖 ragas/datasets/pyarrow，存在 pyarrow pickle bug、结果 NaN、judge 与生成同模型的自引用失真。改为人工黄金集 + 检索 recall@k + LLM-as-judge，指标更可信、维护成本更低。
+- **轻量评估 → RAGAS**：曾因旧版 pyarrow `MonthDayNano` pickle bug 与结果 NaN 弃用 RAGAS 改用自建轻量评估（recall@k + LLM-as-judge）；2026-09 升级 pyarrow ≥17 后 bug 已消除，换回 RAGAS 4 维标准评估（faithfulness / answer_relevancy / context_precision / context_recall）。
 - **`MAX_ITERATIONS` 参数化**：评估不再修改全局 `settings`（原全局可变状态在并发下会互相踩），而是通过 `run_query(..., max_iterations=...)` 传入。
 
 ## 测试与质量

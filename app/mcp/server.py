@@ -1,19 +1,23 @@
 """
 OmniRAG — MCP 服务器
 ─────────────────────
-自定义 Model Context Protocol 服务器，暴露以下工具：
-  • hybrid_search      — 搜索知识库
-  • web_search         — Tavily 实时网络搜索
-  • summarise_docs     — 总结检索到的上下文
-  • extract_entities   — 对检索文本进行命名实体识别
-  • calculate          — 安全的 Python 表达式求值器
+自定义 Model Context Protocol 服务器，工具 schema 由 app.tools.registry 统一管理：
+  • rag_search   — 混合检索知识库（Dense+Sparse RRF + Cross-Encoder 重排序）
+  • web_search   — Tavily 实时网络搜索（代理绕过 + 双重保障）
+  • full_query   — 跑完整多 Agent 工作流（监督者→检索→综合→评审）
+  • evaluate     — 对黄金集跑 RAGAS 4 维评估（faithfulness / answer_relevancy / context_precision / context_recall）
+
+schema 与 workflow 监督者的 Function Calling 工具共享同一份定义（registry.py），
+实现一处定义、两处使用：内部 bind_tools 路由 + 外部 MCP 宿主调用。
+
+只保留宿主 LLM 本身做不到的外部能力：
+  - summarise_docs / extract_entities / calculate 已移除：
+    这些是 LLM 提示词包一层，宿主直接调用 LLM 更快，做成 MCP 工具纯浪费往返。
 
 独立运行：python -m app.mcp.server
 """
 
-import ast
 import logging
-import operator
 import os
 import sys
 from typing import Any
@@ -43,119 +47,49 @@ _ensure_pywin32_dlls()
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent
+
+from app.tools.registry import get_mcp_tools
 
 logger = logging.getLogger(__name__)
 
 app = Server("omnirag-mcp")
 
-# ── 工具定义 ──────────────────────────────────────────────────────────────────
-
-TOOLS = [
-    Tool(
-        name="hybrid_search",
-        description=(
-            "使用混合 dense+sparse 检索并通过 cross-encoder 重排序来搜索内部知识库。"
-            "用于查询已导入文档的问题。"
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "搜索查询"},
-                "top_k": {"type": "integer", "default": 5, "description": "返回的结果数量"},
-            },
-            "required": ["query"],
-        },
-    ),
-    Tool(
-        name="web_search",
-        description=(
-            "使用 Tavily 搜索实时网络。用于查询当前事件、最新数据、"
-            "或知识库中没有的内容。"
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "网络搜索查询"},
-                "max_results": {"type": "integer", "default": 5},
-            },
-            "required": ["query"],
-        },
-    ),
-    Tool(
-        name="summarise_docs",
-        description="将文档内容列表总结为简洁的段落。",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "documents": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "需要总结的文档文本块列表",
-                },
-                "focus": {"type": "string", "description": "关注的方面"},
-            },
-            "required": ["documents"],
-        },
-    ),
-    Tool(
-        name="extract_entities",
-        description="从文本中提取命名实体（人物、组织、日期、数字）。",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "需要提取实体的文本"},
-            },
-            "required": ["text"],
-        },
-    ),
-    Tool(
-        name="calculate",
-        description="安全地求值数学表达式。例如 '2 + 2 * 10 / 5'。",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "expression": {"type": "string", "description": "数学表达式"},
-            },
-            "required": ["expression"],
-        },
-    ),
-]
-
 
 # ── 工具处理器 ─────────────────────────────────────────────────────────────────
+# 工具 schema 从 registry 导入，与 workflow 监督者的 Function Calling 共享。
 
 @app.list_tools()
-async def list_tools() -> list[Tool]:
-    return TOOLS
+async def list_tools() -> list:
+    return get_mcp_tools()
 
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    if name == "hybrid_search":
-        return await _hybrid_search(**arguments)
+    if name == "rag_search":
+        return await _rag_search(**arguments)
     elif name == "web_search":
         return await _web_search(**arguments)
-    elif name == "summarise_docs":
-        return await _summarise_docs(**arguments)
-    elif name == "extract_entities":
-        return await _extract_entities(**arguments)
-    elif name == "calculate":
-        return await _calculate(**arguments)
+    elif name == "full_query":
+        return await _full_query(**arguments)
+    elif name == "evaluate":
+        return await _evaluate(**arguments)
     else:
         return [TextContent(type="text", text=f"未知工具: {name}")]
 
 
 # ── 实现 ───────────────────────────────────────────────────────────────────────
 
-async def _hybrid_search(query: str, top_k: int = 5) -> list[TextContent]:
+async def _rag_search(query: str, top_k: int = 5) -> list[TextContent]:
     try:
+        from app.agents.rag_agent import create_retriever
         from app.config import settings
-        from app.rag.retriever import HybridRetriever
 
-        # top_k 语义修正：候选池取 max(top_k, 默认值)，最终返回重排后的 top_k
-        retriever = HybridRetriever(
-            top_k=max(top_k, settings.retrieval_top_k),
+        # 复用 rag_agent 的共享检索器工厂（同一套参数逻辑 + lru_cache 单例）。
+        # 候选池取 top_k × 2（最少为默认 top_k），重排后再截取 top_k，
+        # 保证 Cross-Encoder 有足够候选对比，不因为用户传小 top_k 而浪费重排序。
+        retriever = create_retriever(
+            top_k=max(top_k * 2, settings.retrieval_top_k),
             reranker_top_n=top_k,
         )
         docs = retriever.invoke(query)
@@ -174,107 +108,119 @@ async def _hybrid_search(query: str, top_k: int = 5) -> list[TextContent]:
             )
         return [TextContent(type="text", text="\n\n---\n\n".join(results))]
     except Exception as e:
-        logger.error("hybrid_search 错误: %s", e)
+        logger.error("rag_search 错误: %s", e)
         return [TextContent(type="text", text=f"搜索错误: {e}")]
 
 
 async def _web_search(query: str, max_results: int = 5) -> list[TextContent]:
-    try:
-        from tavily import TavilyClient
+    """复用 web_agent.py 中已修过代理问题的 tavily_search_robust，
+    避免两处各写一份 Tavily 调用导致其中一处又被代理卡死。"""
+    import asyncio
 
-        from app.config import settings
-        client = TavilyClient(api_key=settings.tavily_api_key)
-        response = client.search(query=query, max_results=max_results)
+    try:
+        from app.agents.web_agent import tavily_search_robust
+
+        raw = await asyncio.to_thread(
+            tavily_search_robust, query, max_results=max_results
+        )
+        if not raw:
+            return [TextContent(type="text", text="无网络搜索结果。")]
         results = []
-        for r in response.get("results", []):
+        for r in raw:
             results.append(
                 f"**{r.get('title','无标题')}**\n"
                 f"URL: {r.get('url','')}\n"
                 f"{r.get('content','')}"
             )
-        return [TextContent(type="text", text="\n\n---\n\n".join(results) or "无网络搜索结果。")]
+        return [TextContent(type="text", text="\n\n---\n\n".join(results))]
     except Exception as e:
         logger.error("web_search 错误: %s", e)
         return [TextContent(type="text", text=f"网络搜索错误: {e}")]
 
 
-async def _summarise_docs(documents: list, focus: str = "") -> list[TextContent]:
+async def _full_query(
+    query: str,
+    thread_id: str = "",
+    max_iterations: int = 2,
+) -> list[TextContent]:
+    """运行完整多 Agent 工作流：监督者路由 → 检索 → 综合 → 评审。
+    用独立的 MCP checkpoint 数据库（mcp_checkpoints.db），避免与用户对话/评估冲突。
+    """
+    import asyncio
+    import uuid
+
+    from app.config import settings
+    from app.graph.workflow import arun_query
+
+    db_path = os.path.join(settings.data_dir, "mcp_checkpoints.db")
+    tid = thread_id or f"mcp-{uuid.uuid4().hex[:8]}"
     try:
-        from langchain_community.chat_models import ChatZhipuAI
-        from langchain_core.prompts import ChatPromptTemplate
-
-        from app.config import settings
-
-        combined = "\n\n---\n\n".join(documents[:8])
-        focus_clause = f"请特别关注: {focus}。" if focus else ""
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", f"简洁地总结以下文档内容。{focus_clause}"),
-            ("human", "{text}"),
-        ])
-        llm = ChatZhipuAI(
-            model=settings.zhipu_model,
-            zhipuai_api_key=settings.zhipuai_api_key,
-            temperature=0,
+        result = await arun_query(
+            query,
+            thread_id=tid,
+            max_iterations=max_iterations,
+            db_path=db_path,
         )
-        response = (prompt | llm).invoke({"text": combined})
-        return [TextContent(type="text", text=response.content)]
-    except Exception as e:
-        return [TextContent(type="text", text=f"总结错误: {e}")]
-
-
-async def _extract_entities(text: str) -> list[TextContent]:
-    try:
-        from langchain_community.chat_models import ChatZhipuAI
-        from langchain_core.prompts import ChatPromptTemplate
-
-        from app.config import settings
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """从文本中提取命名实体。以结构化列表形式返回：
-人物: ...
-组织: ...
-日期: ...
-数字/指标: ...
-地点: ..."""),
-            ("human", "{text}"),
-        ])
-        llm = ChatZhipuAI(
-            model=settings.zhipu_model,
-            zhipuai_api_key=settings.zhipuai_api_key,
-            temperature=0,
+        answer = result.get("final_answer") or result.get("draft_answer", "（无答案）")
+        route = result.get("route", "")
+        iterations = result.get("iterations", 0)
+        critique = result.get("critique", "")
+        summary = (
+            f"路由: {route} | 评审轮数: {iterations}"
+            f"{' | 评审: ' + critique if critique else ''}"
+            f" | thread_id: {tid}\n\n"
         )
-        response = (prompt | llm).invoke({"text": text[:3000]})
-        return [TextContent(type="text", text=response.content)]
+        return [TextContent(type="text", text=summary + answer)]
     except Exception as e:
-        return [TextContent(type="text", text=f"实体提取错误: {e}")]
+        logger.error("full_query 错误: %s", e)
+        return [TextContent(type="text", text=f"查询失败: {e}")]
 
 
-async def _calculate(expression: str) -> list[TextContent]:
-    """安全的数学求值器 — 不执行/求值任意代码。"""
-    SAFE_OPS = {
-        ast.Add: operator.add, ast.Sub: operator.sub,
-        ast.Mult: operator.mul, ast.Div: operator.truediv,
-        ast.Pow: operator.pow, ast.USub: operator.neg,
-        ast.Mod: operator.mod,
-    }
+async def _evaluate(k: int = 10) -> list[TextContent]:
+    """跑 RAGAS 4 维评估（同步长任务，用 asyncio.to_thread 不阻塞 MCP 心跳）。"""
+    import asyncio
 
-    def _eval(node):
-        if isinstance(node, ast.Constant):
-            return node.value
-        elif isinstance(node, ast.BinOp):
-            return SAFE_OPS[type(node.op)](_eval(node.left), _eval(node.right))
-        elif isinstance(node, ast.UnaryOp):
-            return SAFE_OPS[type(node.op)](_eval(node.operand))
-        else:
-            raise ValueError(f"不支持的操作: {type(node)}")
+    from app.rag.evaluation import run_evaluation
 
     try:
-        tree = ast.parse(expression, mode="eval")
-        result = _eval(tree.body)
-        return [TextContent(type="text", text=f"{expression} = {result}")]
+        result = await asyncio.to_thread(
+            run_evaluation,
+            samples=None,
+            k=k,
+        )
+        if result.get("error"):
+            return [TextContent(type="text", text=f"评估失败: {result['error']}")]
+
+        m = result["metrics"]
+        lines = [
+            f"## 评估结果（{result.get('sample_count', 0)} 条样本, RAGAS）",
+            f"- Faithfulness: {_fmt_metric(m.get('faithfulness'))}",
+            f"- Answer Relevancy: {_fmt_metric(m.get('answer_relevancy'))}",
+            f"- Context Precision: {_fmt_metric(m.get('context_precision'))}",
+            f"- Context Recall: {_fmt_metric(m.get('context_recall'))}",
+            f"- 摘要: {result.get('summary', '')}",
+            f"- 报告: {result.get('report_path', '')}",
+            "",
+            "## 单条样本",
+        ]
+        for s in result.get("samples", []):
+            lines.append(
+                f"Q: {s.get('query','')[:80]}\n"
+                f"   faith={_fmt_metric(s.get('faithfulness'))} "
+                f"rel={_fmt_metric(s.get('answer_relevancy'))} "
+                f"cprec={_fmt_metric(s.get('context_precision'))} "
+                f"crec={_fmt_metric(s.get('context_recall'))}"
+            )
+        return [TextContent(type="text", text="\n".join(lines))]
     except Exception as e:
-        return [TextContent(type="text", text=f"计算错误: {e}")]
+        logger.error("evaluate 错误: %s", e)
+        return [TextContent(type="text", text=f"评估失败: {e}")]
+
+
+def _fmt_metric(v):
+    if v is None:
+        return "N/A"
+    return f"{v:.3f}"
 
 
 # ── 入口点 ─────────────────────────────────────────────────────────────────────
