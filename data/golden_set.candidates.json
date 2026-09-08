@@ -1,0 +1,25 @@
+{
+  "_comment": "黄金集候选（2026-09-08 16:04 由 scripts/build_golden_set.py 从知识库生成，LLM 自动提炼）。【必须人工校验】答案可能含 LLM 偏差，核对后再合并进 golden_set.json。",
+  "samples": [
+    {
+      "query": "如何使用命令行导入PDF文档到系统？",
+      "ground_truth": "使用命令行运行python scripts/ingest.py --file docs/你的文档.pdf，或者使用curl命令curl -X POST -F \"file=@你的文档.pdf\" http://localhost:8000/api/ingest/file导入PDF文档。",
+      "source": "README"
+    },
+    {
+      "query": "2026年9月1日，用户在使用Qdrant时遇到了什么问题？",
+      "ground_truth": "用户遇到了流式请求失败（500）的问题，`/api/config`和`/api/stats`接口无法连接，导致查询API完全不可用。",
+      "source": "REPAIR_LOG"
+    },
+    {
+      "query": "在 `app/agents/synthesis_agent.py` 中，如何设置简单问题的回答方式？",
+      "ground_truth": "在 `app/agents/synthesis_agent.py` 中，简单问题直接回答，使用 `DIRECT_PROMPT`，设置 `run()` 函数的 `direct` 参数为 `True`，并设置 `max_tokens=500`。",
+      "source": "REPAIR_LOG"
+    },
+    {
+      "query": "在 `app/rag/ingestion.py` 文件中，对 TLS 和存储做了哪些改动？",
+      "ground_truth": "对 TLS 1.2 强制并实施退避重试策略，对 dense 降级 store 进行了优化。",
+      "source": "REPAIR_LOG"
+    }
+  ]
+}
