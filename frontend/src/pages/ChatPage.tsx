@@ -361,6 +361,11 @@ export function ChatPage({ config }: { config: AppConfig | null }) {
               t.id === assistantId ? { ...t, critique: { passed: !!ev.passed, detail: ev.detail ?? "" } } : t,
             ),
           )
+        } else if (ev.type === "token" && ev.text) {
+          // token 级流式：逐字追加答案，用户约 1s 内看到首个字符
+          setTurns((prev) =>
+            prev.map((t) => (t.id === assistantId ? { ...t, answer: (t.answer ?? "") + ev.text! } : t)),
+          )
         } else if (ev.type === "final" && ev.result) {
           setTurns((prev) =>
             prev.map((t) => (t.id === assistantId ? { ...t, result: ev.result, answer: ev.result!.final_answer } : t)),

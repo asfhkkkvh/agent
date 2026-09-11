@@ -125,6 +125,40 @@ class SynthesisAgent:
         logger.info("Synthesis agent 完成（含评审反馈: %s）", bool(critique))
         return response.content
 
+    async def arun_stream(
+        self,
+        query: str,
+        rag_context: str,
+        web_context: str,
+        critique: str = "",
+        previous_answer: str = "",
+        history: str = "",
+        direct: bool = False,
+    ):
+        """流式生成：逐 token yield 内容片段。
+
+        供 workflow 的 synthesis_node 做 token 级 SSE（感知延迟优化——
+        用户约 1s 内看到首字，而不是干等完整生成）。与非流式 run()
+        共用同一组 prompt / 参数，行为一致，只是传输方式不同。
+        """
+        if direct:
+            chain = DIRECT_PROMPT | get_llm(temperature=0.1, max_tokens=500)
+            inputs = {"query": query, "history": history or "（无）"}
+        else:
+            chain = SYNTHESIS_PROMPT | get_llm(temperature=0.1, max_tokens=1200)
+            inputs = {
+                "query": query,
+                "history": history or "（无）",
+                "rag_context": rag_context or "未检索到知识库上下文。",
+                "web_context": web_context or "未执行网络搜索。",
+                "previous_answer": previous_answer or "（无）",
+                "critique": critique or "（无）",
+            }
+        async for chunk in chain.astream(inputs):
+            content = getattr(chunk, "content", "")
+            if content:
+                yield content
+
 
 @lru_cache
 def create_synthesis_agent() -> SynthesisAgent:

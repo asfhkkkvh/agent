@@ -18,6 +18,12 @@ from app.rag.retriever import HybridRetriever
 
 logger = logging.getLogger(__name__)
 
+# 未命中标记：workflow 的路由环用它判断"RAG 走错了 → 补路 Web"
+EMPTY_RESULT = "知识库中未找到相关文档。"
+# 全部候选的重排分都低于此阈值时视为"弱命中"（召回的是无关噪音），
+# 与空结果一样触发路由环补路。bge-reranker 好文档一般 > 0.3，0.15 足够保守。
+WEAK_HIT_THRESHOLD = 0.15
+
 RAG_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """你是一个精准的文档检索研究智能体。
 
@@ -44,7 +50,22 @@ class RAGAgent:
         logger.info("RAG agent 检索耗时 %.1fs", time.perf_counter() - _t)
         if not docs:
             logger.warning("RAG agent: 未检索到文档: %s", query)
-            return "知识库中未找到相关文档。"
+            return EMPTY_RESULT
+
+        # 路由环信号：全部候选重排分都过低 → 召回的是无关噪音，
+        # 视为"弱命中"返回未命中标记，让 workflow 补路到 Web。
+        # 注意：降级纯 dense 时可能没有 rerank_score，此时不判弱（避免误伤）。
+        scores = [
+            float(meta.get("rerank_score"))
+            for doc in docs
+            if isinstance((meta := doc.metadata).get("rerank_score"), (int, float))
+        ]
+        if scores and max(scores) < WEAK_HIT_THRESHOLD:
+            logger.warning(
+                "RAG 弱命中（最高重排分 %.3f < %.2f），视为未命中: %s",
+                max(scores), WEAK_HIT_THRESHOLD, query,
+            )
+            return EMPTY_RESULT
 
         # 格式化上下文
         context_parts = []

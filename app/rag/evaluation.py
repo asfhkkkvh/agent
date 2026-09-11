@@ -108,10 +108,14 @@ def _retrieve_top_k(sample: Dict[str, str], k: int) -> List[str]:
 def run_evaluation(
     samples: Optional[List[Dict[str, str]]] = None,
     k: Optional[int] = None,
+    max_iterations: int = 1,
 ) -> Dict[str, Any]:
     """跑一次 RAGAS 4 维评估，返回指标均值 + 单条样本详情。
 
     samples 不传时从 data/golden_set.json 加载。
+    max_iterations：评审闭环轮数。1=关闭闭环（测"一次性生成"基线），
+    2=生产配置（闭环开启，评审可 REVISE 回综合重写，最多 2 轮）。
+    两组对比可量化"评审修订闭环"对端到端质量的真实贡献。
     """
     samples = samples or load_golden_set()
     if not samples:
@@ -149,12 +153,12 @@ def run_evaluation(
     for s in samples:
         query = s["query"]
         try:
-            # max_iterations=1：关闭评审循环，评估关心检索+生成质量
+            # max_iterations：评审闭环轮数（1=基线关闭闭环，2=生产开启闭环）
             # db_path：独立 eval 数据库，避免与用户对话写锁冲突
             result = run_query(
                 query,
                 thread_id=f"eval-{uuid.uuid4().hex[:8]}",
-                max_iterations=1,
+                max_iterations=max_iterations,
                 db_path=_EVAL_DB,
             )
             answer = result.get("final_answer") or result.get("draft_answer", "")

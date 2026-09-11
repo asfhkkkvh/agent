@@ -52,6 +52,38 @@ class AgentState(TypedDict):
     iterations: int
     route: str
     direct_answer: bool  # 简单常识问题直接回答，不走检索
+    # 路由环（检索后纠错）：链路未命中 / 链路已执行标记
+    rag_empty: bool  # RAG 未命中（空结果或弱命中）
+    web_empty: bool  # Web 未命中（搜索失败或无结果）
+    rag_ran: bool    # RAG 链路已执行（防 rag↔web 互补死循环）
+    web_ran: bool    # Web 链路已执行
+
+
+# ── 路由环：未命中标记检测 ─────────────────────────────────────────────────────
+# 监督者是纯 LLM 决策，无法事后感知"选错了"；真正的纠错信号只能来自
+# 执行结果：检索返回空 / 弱命中（rag_agent.EMPTY_RESULT / web_agent 失败文案）。
+# 检测到未命中且对方链路未跑 → 补路，形成"监督者决策 → 执行 → 结果校验 →
+# 纠错补路"的路由环（与生成后的评审环互补，一个是纠信息源、一个是纠答案质量）。
+
+EMPTY_MARKERS = ("知识库中未找到相关文档。", "未找到网络搜索结果。", "网络搜索失败")
+
+# 直答失败标记：监督者误判 direct_answer 时，答案常以"无法/抱歉/没有提供"开头。
+# 路由环检测到直答失败 → 补路双路检索，弥补 GLM-4-Flash function calling 的误判。
+ANSWER_FAIL_MARKERS = ("无法", "抱歉", "没有提供", "未提供", "不清楚", "未找到")
+
+
+def _is_empty_result(text: str) -> bool:
+    """判断检索结果是否为"未命中"标记文案。"""
+    text = (text or "").strip()
+    if not text:
+        return True
+    return any(text.startswith(m) for m in EMPTY_MARKERS)
+
+
+def _is_answer_failed(text: str) -> bool:
+    """判断直答结果是否"没答出来"（触发补路检索）。"""
+    text = (text or "").strip()
+    return any(m in text for m in ANSWER_FAIL_MARKERS)
 
 
 # ── 对话历史工具 ──────────────────────────────────────────────────────────────
@@ -86,8 +118,10 @@ SUPERVISOR_SYSTEM_PROMPT = """你是监督者，负责为研究查询选择最�
 
 决策规则：
 1. 先判断是否需要检索：
-   - 问候、算术、通用定义等简单常识问题 → direct_answer（不检索，直接回答）
+   - 仅问候、寒暄、简单算术等不依赖任何外部信息的问题 → direct_answer（不检索）
    - 其余问题必须选择检索工具，不能只回复文本而不调用工具。
+   - 禁止用自身知识直接回答需要事实依据的问题——天气、新闻、股价等实时信息
+     以及文档内容、具体数据，一律必须检索，绝不允许 direct_answer 后编造。
 2. 依据查询语义选择工具：
    - 问题内容可能来自用户上传的文档（涉及报告、论文、笔记里的内容）→ rag_search
    - 问题涉及外部世界的最新信息、产品或模型 → web_search
@@ -154,7 +188,13 @@ async def rag_node(state: AgentState) -> AgentState:
     agent = create_rag_agent()
     context = await asyncio.to_thread(agent.run, state["query"])
     logger.info("RAG 节点耗时 %.1fs", time.perf_counter() - _t)
-    return {**state, "rag_context": context}
+    empty = _is_empty_result(context)
+    return {
+        **state,
+        "rag_context": "" if empty else context,
+        "rag_empty": empty,
+        "rag_ran": True,
+    }
 
 
 async def web_node(state: AgentState) -> AgentState:
@@ -162,11 +202,25 @@ async def web_node(state: AgentState) -> AgentState:
     agent = create_web_agent()
     context = await asyncio.to_thread(agent.run, state["query"])
     logger.info("Web 节点耗时 %.1fs", time.perf_counter() - _t)
-    return {**state, "web_context": context}
+    empty = _is_empty_result(context)
+    return {
+        **state,
+        "web_context": "" if empty else context,
+        "web_empty": empty,
+        "web_ran": True,
+    }
 
 
 async def both_node(state: AgentState) -> AgentState:
-    """RAG 与 Web 检索真正并行执行（asyncio.gather）。"""
+    """RAG 与 Web 检索真正并行执行（asyncio.gather）。
+
+    双路已并行执行，天然覆盖"两条信息源"，无需路由环补路，
+    因此直接标记两条链路均已执行。
+
+    同时重置 direct_answer 与旧草稿：
+    - 本节点执行了真实检索，之后必须走正常综合 + 评审（不能再被当直答跳过评审）
+    - 清空 draft_answer，避免直答失败的旧答案污染第二次综合
+    """
     rag_fut, web_fut = await asyncio.gather(
         rag_node(state),
         web_node(state),
@@ -175,6 +229,12 @@ async def both_node(state: AgentState) -> AgentState:
         **state,
         "rag_context": rag_fut["rag_context"],
         "web_context": web_fut["web_context"],
+        "rag_empty": rag_fut["rag_empty"],
+        "web_empty": web_fut["web_empty"],
+        "rag_ran": True,
+        "web_ran": True,
+        "direct_answer": False,
+        "draft_answer": "",
     }
 
 
@@ -183,11 +243,22 @@ async def synthesis_node(state: AgentState) -> AgentState:
 
     direct_answer（简单问题直接回答）时答案即为最终答案：
     由 route_after_synthesis 跳过评审直接结束，省一次 LLM 往返。
+
+    token 级流式：节点内用 get_stream_writer() 把 LLM 逐 token 内容透传
+    给 stream_query（stream_mode="custom"），前端约 1s 内看到首字，
+    而不是等完整生成（感知延迟优化）。非流式调用（graph.ainvoke）时
+    writer 为 no-op，行为与原来完全一致。
     """
     _t = time.perf_counter()
     agent = create_synthesis_agent()
-    answer = await asyncio.to_thread(
-        agent.run,
+    try:
+        from langgraph.config import get_stream_writer
+        writer = get_stream_writer()
+    except Exception:
+        writer = None
+
+    parts: list[str] = []
+    async for token in agent.arun_stream(
         state["query"],
         state.get("rag_context", ""),
         state.get("web_context", ""),
@@ -195,7 +266,15 @@ async def synthesis_node(state: AgentState) -> AgentState:
         state.get("draft_answer", ""),
         format_history(state.get("messages", [])),
         state.get("direct_answer", False),
-    )
+    ):
+        parts.append(token)
+        if writer is not None:
+            try:
+                await writer({"type": "token", "text": token})
+            except Exception:
+                pass  # 非 custom 流式模式时 writer 丢弃数据，不影响答案
+
+    answer = "".join(parts)
     logger.info("综合节点耗时 %.1fs", time.perf_counter() - _t)
     direct = state.get("direct_answer", False)
     return {
@@ -295,16 +374,41 @@ def route_critique(state: AgentState) -> Literal["synthesis_node", "end"]:
     return "synthesis_node"
 
 
-def route_after_synthesis(state: AgentState) -> Literal["critique_node", "end"]:
+def route_after_synthesis(state: AgentState) -> Literal["both_node", "critique_node", "end"]:
     """综合节点之后的分流。
 
-    - direct_answer（简单问题直接回答）：已生成最终答案，跳过评审直接结束
-      （省一次 LLM 往返，简单问答无需质量门禁）。
-    - 其余情况：进入评审节点做事实核查。
+    - direct_answer 且直答成功 → 直接结束（省一次 LLM 往返，简单问答无需质量门禁）
+    - direct_answer 但直答失败（答案含"无法/抱歉/没有提供"等）→ 补路双路检索
+      （监督者误判 direct_answer 的路由环兜底；both_node 会重置 direct_answer，
+      第二次综合后走正常评审，最多补路一次不会死循环）
+    - 其余情况 → 进入评审节点做事实核查
     """
     if state.get("direct_answer"):
+        if _is_answer_failed(state.get("draft_answer", "")):
+            logger.info("路由环: direct_answer 直答失败，补路双路检索: %s", state["query"][:40])
+            return "both_node"
         return "end"
     return "critique_node"
+
+
+def route_after_rag(state: AgentState) -> Literal["web_node", "synthesis_node"]:
+    """路由环：RAG 未命中且 Web 没跑过 → 补路 Web；否则进入综合。
+
+    依赖 rag_ran/web_ran 标记防止互补死循环：
+    即使补路后的 Web 也未命中，route_after_web 看到 rag_ran=True 也不会跳回 RAG。
+    """
+    if state.get("rag_empty") and not state.get("web_ran"):
+        logger.info("路由环: RAG 未命中，补路 Web: %s", state["query"][:40])
+        return "web_node"
+    return "synthesis_node"
+
+
+def route_after_web(state: AgentState) -> Literal["rag_node", "synthesis_node"]:
+    """路由环：Web 未命中且 RAG 没跑过 → 补路 RAG；否则进入综合。"""
+    if state.get("web_empty") and not state.get("rag_ran"):
+        logger.info("路由环: Web 未命中，补路 RAG: %s", state["query"][:40])
+        return "rag_node"
+    return "synthesis_node"
 
 
 # ── 图组装 ─────────────────────────────────────────────────────────────────────
@@ -332,15 +436,29 @@ def build_graph(checkpointer=None, max_iterations: Optional[int] = None):
         },
     )
 
-    graph.add_edge("rag_node", "synthesis_node")
-    graph.add_edge("web_node", "synthesis_node")
+    # 检索后路由环：单路未命中 → 补路另一条信息源；双路已并行则直通综合
+    graph.add_conditional_edges(
+        "rag_node",
+        route_after_rag,
+        {"web_node": "web_node", "synthesis_node": "synthesis_node"},
+    )
+    graph.add_conditional_edges(
+        "web_node",
+        route_after_web,
+        {"rag_node": "rag_node", "synthesis_node": "synthesis_node"},
+    )
     graph.add_edge("both_node", "synthesis_node")
 
-    # 综合后分流：direct_answer 直接结束（跳过评审），其余进入评审闭环
+    # 综合后分流：direct_answer 成功直接结束（跳过评审），失败补路双路检索，
+    # 其余进入评审闭环
     graph.add_conditional_edges(
         "synthesis_node",
         route_after_synthesis,
-        {"critique_node": "critique_node", "end": END},
+        {
+            "critique_node": "critique_node",
+            "both_node": "both_node",
+            "end": END,
+        },
     )
 
     graph.add_conditional_edges(
@@ -365,6 +483,10 @@ def _initial_state(query: str) -> AgentState:
         "critique": "",
         "iterations": 0,
         "route": "",
+        "rag_empty": False,
+        "web_empty": False,
+        "rag_ran": False,
+        "web_ran": False,
     }
 
 
@@ -423,12 +545,24 @@ def _node_event(node: str, frag: dict) -> dict | None:
     if node == "supervisor":
         return {"type": "status", "step": "route", "detail": f"路由至 {frag.get('route', 'both')}"}
     if node == "rag_node":
+        if frag.get("rag_empty"):
+            return {
+                "type": "status",
+                "step": "rag",
+                "detail": "知识库未命中，准备补路 Web",
+            }
         return {
             "type": "status",
             "step": "rag",
             "detail": f"知识库检索完成（{len(frag.get('rag_context', ''))} 字符）",
         }
     if node == "web_node":
+        if frag.get("web_empty"):
+            return {
+                "type": "status",
+                "step": "web",
+                "detail": "网络搜索未命中，准备补路 RAG",
+            }
         return {
             "type": "status",
             "step": "web",
@@ -480,17 +614,23 @@ async def stream_query(
         graph = build_graph(checkpointer, max_iterations=max_iterations)
         config = {"configurable": {"thread_id": thread_id}}
 
-        async for update in graph.astream(
-            _initial_state(query), config=config, stream_mode="updates"
+        # updates：节点级状态事件；custom：synthesis_node 透传的逐 token 内容
+        async for mode, data in graph.astream(
+            _initial_state(query), config=config, stream_mode=["updates", "custom"]
         ):
-            for node, frag in update.items():
-                event = _node_event(node, frag)
-                if event:
-                    yield event
-                # synthesis_node（direct_answer 直答）或 critique_node（常规闭环）
-                # 都可能是最后产出答案的节点，记录供最终结果提取
-                if node in ("synthesis_node", "critique_node"):
-                    last_state = frag
+            if mode == "updates":
+                for node, frag in data.items():
+                    event = _node_event(node, frag)
+                    if event:
+                        yield event
+                    # synthesis_node（direct_answer 直答）或 critique_node（常规闭环）
+                    # 都可能是最后产出答案的节点，记录供最终结果提取
+                    if node in ("synthesis_node", "critique_node"):
+                        last_state = frag
+            elif mode == "custom":
+                # token 级事件：前端逐字渲染，改善感知延迟
+                if isinstance(data, dict) and data.get("type") == "token":
+                    yield {"type": "token", "text": data.get("text", "")}
 
     if last_state:
         yield {"type": "final", "result": _extract_result(last_state)}

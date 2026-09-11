@@ -998,3 +998,71 @@ RAGAS 换回后的验证过程中，run\_query 单条查询**无限卡死**（12
 
 - `scripts/build_golden_set.py`（新建）：黄金集候选生成脚本
 
+
+---
+
+## 2026-09-08 路由环（检索后纠错）——新增
+
+### 问题
+
+监督者是纯 LLM 决策（function calling），一旦路由出去就没有回头路：
+1. 监督者误判 rag_search，向量库无结果（如"查天气"）→ RAG 返回空/弱命中，但系统不知道要补 Web
+2. 监督者误判 direct_answer（GLM-4-Flash function calling 把"README 项目叫什么"也判成直接回答）→ 绕开检索，直答失败或直接编造
+
+### 方案：三层路由环（检索后 + 直答后纠错）
+
+| 层 | 检测信号 | 动作 |
+| --- | --- | --- |
+| RAG 未命中 | ag_agent.EMPTY_RESULT（空结果 或 全部 rerank_score < 0.15 弱命中） | 补路 web_node |
+| Web 未命中 | web_agent 失败/无结果文案 | 补路 rag_node |
+| 直答失败 | 答案含"无法/抱歉/没有提供"等标记 | 补路 both_node（双路检索） |
+
+防死循环：ag_ran / web_ran 状态标记，rag↔web 最多互补一次；both_node 重置 direct_answer=False 且清空 draft_answer，补路后走正常综合 + 评审。
+
+### 验证（真实查询）
+
+- "README 项目叫什么" → rag 未命中 → 补路 Web ✓
+- "2026 AI 模型" → Tavily 失败 → 补路 RAG ✓
+- "今天北京天气" → GLM 误判 direct_answer 直答失败 → 补路双路 → 正确回答"晴朗 18℃ [Web 2]" ✓
+- 问候"你好" → 直答成功，不补路 ✓
+- pytest 23/23 通过
+
+### 已知边界（诚实记录）
+
+- GLM-4-Flash 对 direct_answer 的误判仍存在（prompt + description 已收紧"实时信息禁止直答"，但免费模型 function calling 遵循度有限）
+- 直答**编造**的"看似完整"答案（如编造天气数字）路由环检测不到——防幻觉职责在评审环，而 direct_answer 为省时跳过评审，此为设计权衡
+
+### 涉及文件
+
+- pp/graph/workflow.py：AgentState 增 rag_empty/web_empty/rag_ran/web_ran；route_after_rag / route_after_web / route_after_synthesis 三层补路；both_node 重置 direct_answer
+- pp/agents/rag_agent.py：EMPTY_RESULT 常量 + WEAK_HIT_THRESHOLD=0.15 弱命中判定
+- pp/tools/registry.py：direct_answer description 收紧（实时信息禁止直答）
+
+---
+
+## 2026-09-10 token 级流式（SSE 逐字推送）——新增
+
+### 问题
+- 综合 LLM 一次性返回完整答案（8~10s），SSE 只有节点级状态事件，用户全程干等
+- OPTIMIZATION_LOG 记录的"最能改善感知卡顿"的未做项
+
+### 方案
+1. synthesis_agent.arun_stream()：async generator，chain.astream 逐 token yield（与 run() 共用同一组 prompt/参数）
+2. synthesis_node：用 langgraph.config.get_stream_writer() 把 token 实时透传（stream_mode="custom"），同时拼装完整答案；非流式调用（ainvoke）时 writer 为 no-op，行为不变
+3. stream_query：astream 双 mode（updates + custom），custom 事件转成 {"type":"token","text":...} SSE 事件
+4. 前端 ChatPage：token 事件逐字追加 answer，Markdown 实时重渲染
+
+### 实测（真实查询"你好"）
+- ChatZhipuAI.stream 原生真流式：12 chunk、首 token 0.71s（裸 LLM）
+- 端到端：start → route(1.4s) → 首 token 1.82s → 7 个 token 事件 → final，总耗时 2.05s
+- 感知延迟：综合生成从"8~10s 干等"变为"约 1s 首字"，剩余逐字涌入
+
+### 边界（诚实记录）
+- 首 token 前仍需等待监督者路由 + 检索（复杂查询检索 18~30s 不可省），流式改善的是"综合生成阶段"的感知延迟
+- 前端顺序：route 状态 → token 流 → synthesis 状态 → final（synthesis 的 updates 事件在节点完成后才到）
+
+### 涉及文件
+- pp/agents/synthesis_agent.py：新增 arun_stream
+- pp/graph/workflow.py：synthesis_node 流式 + stream_query 双 mode
+- rontend/src/lib/api.ts：StreamEvent 增加 token 类型
+- rontend/src/pages/ChatPage.tsx：token 逐字渲染

@@ -21,12 +21,13 @@ export interface QueryResult {
 export type StreamStep = "route" | "rag" | "web" | "both" | "synthesis"
 
 export interface StreamEvent {
-  type: "start" | "status" | "critique" | "final" | "error"
+  type: "start" | "status" | "critique" | "final" | "error" | "token"
   thread_id?: string
   step?: StreamStep
   detail?: string
   passed?: boolean
   result?: QueryResult
+  text?: string
 }
 
 export interface CollectionStats {

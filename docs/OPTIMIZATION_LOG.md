@@ -177,3 +177,16 @@
 | `app/agents/synthesis_agent.py` | 答案输出压缩（max_tokens=700，300~600 字） |
 | `app/agents/critique_agent.py` | 评审标准收紧，减少多余迭代 |
 | `app/config.py` / `.env` | `USE_FILTER_EXTRACTION=false`、`MAX_ITERATIONS=2` |
+
+---
+
+## 2026-09-10 补充：token 级流式（感知延迟优化）
+
+此前 4.x 节记录了"前端 token 级流式"为未做项。本轮实现并实测：
+
+- **裸 LLM 首 token**：glm-4-flash stream=True 实测 **0.71s**（12 个 chunk）
+- **端到端首 token**（直答"你好"）：supervisor 1.4s + 综合首 token → **1.82s**
+- **综合阶段感知延迟**：一次性返回 8~10s 干等 → **约 1s 首字**，剩余逐 token 涌入
+
+预期收益（待前端验证）：复杂查询的综合生成从"进度条干等"变为"边看边等"；
+代价：token 事件数量级为百级，SSE 帧数增加但对单用户无压力。
