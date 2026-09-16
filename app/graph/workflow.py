@@ -257,6 +257,18 @@ async def synthesis_node(state: AgentState) -> AgentState:
     except Exception:
         writer = None
 
+    # 长期记忆召回：与文档 RAG 并行（几 ms 级），注入综合 prompt 独立区域。
+    # 记忆是"提示"而非"事实"：失败静默降级为空，绝不阻塞查询。
+    memory_context = ""
+    if settings.use_memory:
+        try:
+            from app.memory.memory_store import recall_memories
+            memories = recall_memories(state["query"], top_k=settings.memory_top_k)
+            if memories:
+                memory_context = "\n".join(f"- {m}" for m in memories)
+        except Exception:
+            pass
+
     parts: list[str] = []
     async for token in agent.arun_stream(
         state["query"],
@@ -266,6 +278,7 @@ async def synthesis_node(state: AgentState) -> AgentState:
         state.get("draft_answer", ""),
         format_history(state.get("messages", [])),
         state.get("direct_answer", False),
+        memory_context,
     ):
         parts.append(token)
         if writer is not None:
@@ -502,11 +515,41 @@ def _extract_result(result) -> dict:
     }
 
 
+# ── 长期记忆写入（后台异步，不阻塞响应）──────────────────────────────────────
+# 只在用户对话入口（api 传 save_memory=True）触发，评估/MCP 不触发，
+# 避免实验/评估污染记忆库。提炼是离线任务，走 to_thread 不占事件循环。
+
+_background_memory_tasks: set = set()
+
+
+async def _run_memory_save(query: str, answer: str) -> None:
+    """后台执行记忆提炼入库（失败只记日志，不影响主流程）。"""
+    try:
+        from app.memory.memory_store import extract_and_save_memories
+
+        await asyncio.to_thread(extract_and_save_memories, query, answer)
+    except Exception as e:
+        logger.warning("后台记忆写入失败: %s", e)
+
+
+def _schedule_memory_save(query: str, answer: str) -> None:
+    """把记忆提炼任务挂到后台，保持引用防止被 GC，返回后不等待。"""
+    if not settings.use_memory:
+        return
+    answer = (answer or "").strip()
+    if not answer:
+        return
+    task = asyncio.create_task(_run_memory_save(query, answer))
+    _background_memory_tasks.add(task)
+    task.add_done_callback(_background_memory_tasks.discard)
+
+
 async def arun_query(
     query: str,
     thread_id: str = "default",
     max_iterations: Optional[int] = None,
     db_path: Optional[str] = None,
+    save_memory: bool = False,
 ) -> dict:
     """异步执行完整的多 Agent 管道。
 
@@ -515,6 +558,9 @@ async def arun_query(
 
     db_path 可指定独立的 SQLite checkpoint 路径，避免评估与用户对话
     共用同一数据库导致 SQLite 写锁冲突（对话被强制中断）。
+
+    save_memory：仅用户对话入口传 True，完成后后台异步提炼长期记忆；
+    评估 / MCP 不传（默认 False），避免实验污染记忆库。
     """
     db_path = db_path or os.path.join(settings.data_dir, "checkpoints.db")
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
@@ -523,7 +569,10 @@ async def arun_query(
         graph = build_graph(checkpointer, max_iterations=max_iterations)
         config = {"configurable": {"thread_id": thread_id or str(uuid.uuid4())}}
         result = await graph.ainvoke(_initial_state(query), config=config)
-        return _extract_result(result)
+        extracted = _extract_result(result)
+        if save_memory:
+            _schedule_memory_save(query, extracted.get("final_answer", ""))
+        return extracted
 
 
 def run_query(
@@ -531,13 +580,16 @@ def run_query(
     thread_id: str = "default",
     max_iterations: Optional[int] = None,
     db_path: Optional[str] = None,
+    save_memory: bool = False,
 ) -> dict:
     """同步包装：通过 asyncio.run 执行完整管道。
 
     注意：只能在没有运行中事件循环的上下文调用（如 FastAPI 同步端点、
     脚本）。若在 async 环境中调用会抛 RuntimeError，请改用 arun_query。
     """
-    return asyncio.run(arun_query(query, thread_id, max_iterations=max_iterations, db_path=db_path))
+    return asyncio.run(
+        arun_query(query, thread_id, max_iterations=max_iterations, db_path=db_path, save_memory=save_memory)
+    )
 
 
 def _node_event(node: str, frag: dict) -> dict | None:
@@ -594,14 +646,18 @@ async def stream_query(
     query: str,
     thread_id: str = "default",
     max_iterations: Optional[int] = None,
+    save_memory: bool = False,
 ):
     """流式执行管道，逐步产出事件字典（供 SSE 使用）。
 
     事件类型：
     - start:    会话开始，携带 thread_id
     - status:   Agent 节点进度（route / rag / web / both / synthesis）
+    - token:    token 级流式内容（逐字推送，感知延迟优化）
     - critique: 评审结果（passed + detail）
     - final:    最终结果（完整 answer + 上下文）
+
+    save_memory：仅用户对话入口传 True，final 后后台异步提炼长期记忆。
     """
     thread_id = thread_id or str(uuid.uuid4())
     db_path = os.path.join(settings.data_dir, "checkpoints.db")
@@ -633,6 +689,9 @@ async def stream_query(
                     yield {"type": "token", "text": data.get("text", "")}
 
     if last_state:
+        if save_memory:
+            answer = last_state.get("final_answer") or last_state.get("draft_answer", "")
+            _schedule_memory_save(query, answer)
         yield {"type": "final", "result": _extract_result(last_state)}
     else:
         yield {"type": "error", "detail": "工作流未返回结果"}

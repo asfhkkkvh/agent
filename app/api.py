@@ -221,7 +221,8 @@ def query(req: QueryRequest) -> QueryResponse:
     """
     thread_id = req.thread_id or str(uuid.uuid4())
     try:
-        result = run_query(req.query, thread_id=thread_id)
+        # 用户对话入口：完成后后台异步提炼长期记忆（评估/MCP 不走这里）
+        result = run_query(req.query, thread_id=thread_id, save_memory=True)
         return QueryResponse(
             query=req.query,
             thread_id=thread_id,
@@ -249,7 +250,8 @@ async def query_stream(req: QueryRequest) -> StreamingResponse:
 
     async def event_gen():
         try:
-            async for event in stream_query(req.query, thread_id):
+            # save_memory=True：用户对话入口，final 后后台异步提炼长期记忆
+            async for event in stream_query(req.query, thread_id, save_memory=True):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:
             logger.exception("流式查询失败")

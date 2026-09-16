@@ -1066,3 +1066,30 @@ RAGAS 换回后的验证过程中，run\_query 单条查询**无限卡死**（12
 - pp/graph/workflow.py：synthesis_node 流式 + stream_query 双 mode
 - rontend/src/lib/api.ts：StreamEvent 增加 token 类型
 - rontend/src/pages/ChatPage.tsx：token 逐字渲染
+
+---
+
+## 2026-09-16 长期记忆库（v2，P0：写入管道 + 跨会话召回）——新增
+
+### 目标
+把高质量对话提炼为可跨会话检索的记忆条目，与文档知识库物理隔离。
+
+### 实现
+- pp/memory/memory_store.py（新）：
+  - 提炼：LLM 只提取 fact / preference / event 三类，过滤寒暄与一次性问题（"提炼"与"存档"的本质区别）
+  - 存储：独立 omnirag_memory 集合（纯 dense，复用 embedding-3 1024 维），与文档 omnirag_hybrid 物理隔离
+  - 去重：新候选与已有记忆余弦相似度 > 0.92 跳过
+  - 召回：ecall_memories(query, top_k)，任何失败静默降级为空（绝不阻塞在线查询）
+- workflow.py：synthesis_node 注入"长期记忆"提示区域（仅 USE_MEMORY=true 时）；arun_query/stream_query 加 save_memory 参数，完成后后台异步提炼（syncio.create_task + to_thread，不阻塞响应）
+- pi.py：两个对话查询端点传 save_memory=True；评估 / MCP 默认 False（避免实验污染记忆库）
+- config.py / .env.example：USE_MEMORY（默认 false）/ MEMORY_COLLECTION / MEMORY_TOP_K
+
+### 踩坑记录
+1. ChatPromptTemplate 会把 system 提示中的 JSON 示例 {"content": ...} 当成模板变量 → KeyError: '"content"' → 双花括号 {{...}} 转义
+2. QdrantVectorStore.from_existing_collection 内部新建 client 不走代理 patch → SSL 连接失败 → 必须显式传 client=get_qdrant_client()（复用 TLS 1.2 + 重试 + 连接重建）
+
+### 验证
+- 对话1 提及"项目用 Qdrant" → 提炼写入 1 条 fact 记忆
+- 新会话换问法"我用的向量数据库是什么？" → 召回命中"用户的项目使用 Qdrant 向量库"
+- 评估 / MCP 路径不触发记忆写入（save_memory=False）
+- pytest 23/23 通过

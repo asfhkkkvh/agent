@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     # ── 对话记忆 ──────────────────────────────────────────────
     history_window: int = Field(6, validation_alias="HISTORY_WINDOW")
 
+    # ── 长期记忆（v2 记忆库）───────────────────────────────────
+    # 对话结束后异步提炼记忆条目存独立 Qdrant 集合，跨会话按需召回。
+    # 默认关：仅在明确开启时触发提炼（避免评估/实验污染记忆库）。
+    use_memory: bool = Field(False, validation_alias="USE_MEMORY")
+    memory_collection: str = Field("omnirag_memory", validation_alias="MEMORY_COLLECTION")
+    memory_top_k: int = Field(3, validation_alias="MEMORY_TOP_K")
+
     # ── Agent 设置 ───────────────────────────────────────────
     # 评审闭环最大轮数。各 Agent 的温度统一在 app/llm.py 的 get_llm() 里按角色指定，
     # 不再提供全局 AGENT_TEMPERATURE（避免死配置）。

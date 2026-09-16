@@ -67,6 +67,9 @@ SYNTHESIS_PROMPT = ChatPromptTemplate.from_messages([
 --- 评审反馈 ---
 {critique}
 
+--- 长期记忆（v2：跨会话记得的用户偏好/事实，仅供参考） ---
+{memory_context}
+
 请给出你的综合答案:"""),
 ])
 
@@ -100,6 +103,7 @@ class SynthesisAgent:
         previous_answer: str = "",
         history: str = "",
         direct: bool = False,
+        memory_context: str = "",
     ) -> str:
         _t = time.perf_counter()
 
@@ -120,6 +124,7 @@ class SynthesisAgent:
             "web_context": web_context or "未执行网络搜索。",
             "previous_answer": previous_answer or "（无）",
             "critique": critique or "（无）",
+            "memory_context": memory_context or "（无）",
         })
         logger.info("Synthesis agent LLM 耗时 %.1fs", time.perf_counter() - _t)
         logger.info("Synthesis agent 完成（含评审反馈: %s）", bool(critique))
@@ -134,6 +139,7 @@ class SynthesisAgent:
         previous_answer: str = "",
         history: str = "",
         direct: bool = False,
+        memory_context: str = "",
     ):
         """流式生成：逐 token yield 内容片段。
 
@@ -153,6 +159,7 @@ class SynthesisAgent:
                 "web_context": web_context or "未执行网络搜索。",
                 "previous_answer": previous_answer or "（无）",
                 "critique": critique or "（无）",
+                "memory_context": memory_context or "（无）",
             }
         async for chunk in chain.astream(inputs):
             content = getattr(chunk, "content", "")

@@ -40,6 +40,7 @@ Sparse(FastEmbed BM25)   ┘             (bge-reranker-base)
 - **混合检索**：dense + sparse 倒数秩融合 + 本地 cross-encoder 重排，支持 LLM 提取元数据过滤器与多查询扩展
 - **自评审闭环**：评审 Agent 的 REVISE 反馈传回综合 Agent 迭代修订，默认最多 5 轮，可通过 `MAX_ITERATIONS` 调整
 - **对话记忆**：LangGraph SQLite checkpoint，同一 `thread_id` 延续上下文
+- **长期记忆（v2）**：高质量对话异步提炼为记忆条目（fact/preference/event），存独立 Qdrant 集合，跨会话按需召回（`USE_MEMORY=true` 开启）
 - **接口完整**：FastAPI REST + SSE 流式事件（路由/检索/综合/评审逐步可见）、文件/文本导入、知识库统计、MCP Server
 - **RAGAS 评估**：人工黄金集 + RAGAS 4 维 LLM-judge（faithfulness / answer_relevancy / context_precision / context_recall）
 - **LangSmith 可观测**：全链路追踪
